@@ -1,0 +1,1 @@
+这是一个formal的工作流，我希望在这个工作流里面加一个阶段，在bug分析阶段前，根据分析 formal工具运行的结果以及反例，形成python的反例。picker可以将rtl转换成python包，具体用法可以参考ucagent/lang/zh/doc/Guide_Doc 可以不那么复杂，直接操作引脚构建测试用例即可，比如说dut.a = xxx dut.b = xxx

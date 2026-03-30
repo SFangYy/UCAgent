@@ -150,7 +150,7 @@ mcp_server:
     请通过工具`RoleInfo`获取你的角色信息和基本指导，然后完成任务。请使用工具`ReadTextFile`读取文件。
 
 # ============================================================================
-# Stage Definition — 8-stage progressive formal verification
+# Stage Definition — 11-stage progressive formal verification
 # ============================================================================
 stage:
   # ========== Stage 1: Requirement Analysis and Verification Planning ==========
@@ -313,7 +313,7 @@ stage:
       - "Guide_Doc/dut_bug_analysis.md"
       - "{DUT}/__init__.py"
       - "{OUT}/03_{DUT}_functions_and_checks.md"
-      - "{OUT}/04_{DUT}_basic_info.md"
+      - "{OUT}/02_{DUT}_basic_info.md"
     output_files:
       - "{OUT}/04_{DUT}_static_bug_analysis.md"
     checker:
@@ -500,7 +500,78 @@ stage:
           checker_file: "{OUT}/tests/{DUT}_checker.sv"
           coi_threshold: 95.0
 
-  # ========== Stage 9: RTL Defect Analysis and Reporting ==========
+  # ========== Stage 9: Counterexample Python Test Generation ==========
+  - name: counterexample_python_testgen
+    desc: "形式化反例 Python 测试用例生成"
+    task:
+      - "目标：根据形式化验证结果中标记为 [RTL_BUG] 的 FALSE 属性及其反例，使用 picker 生成的 Python DUT 包，编写可执行的引脚级 Python 测试用例来复现 Bug。"
+      - "第1步：读取 `{OUT}/tests/{DUT}_checker.sv`，提取所有标记了 `// [RTL_BUG]` 的属性名称及其描述注释。"
+      - "第2步：读取 `{OUT}/tests/avis.log`，分析每个 FALSE 属性对应的反例信息（触发条件、信号值、时序关系）。"
+      - "第3步：读取 `{OUT}/tests/{DUT}_wrapper.sv`，确认时钟端口和复位端口的 RTL 原始名称及极性（参考 Clock/Reset Remapping 区域的注释）。"
+      - "第4步：读取 RTL 源码文件（{RTL_PATH}/*.v, {RTL_PATH}/*.sv），结合反例信息，确定每个 Bug 的具体触发输入序列。"
+      - "第5步：为每个 [RTL_BUG] 属性生成一个 Python 测试函数。测试用例**直接操作 DUT 引脚**，不需要封装 API 或 ENV。标准结构如下："
+      - "  ```python"
+      - "  from {DUT} import DUT{DutClass}  # picker 生成的 Python DUT 包"
+      - "  "
+      - "  def test_cex_ck_xxx():"
+      - "      '''反例测试：CK_XXX 属性 — Bug描述"
+      - "      "
+      - "      对应属性: A_CK_XXX"
+      - "      反例条件: a=0xFF, b=0x01, cin=1"
+      - "      预期行为: sum 应等于 0x101"
+      - "      实际行为: sum 被截断为 0x01"
+      - "      '''"
+      - "      dut = DUT{DutClass}()"
+      - "      dut.InitClock('clk')  # 时钟名需与 RTL 一致"
+      - "      "
+      - "      # 复位序列"
+      - "      dut.rst_n.value = 0"
+      - "      dut.Step(5)"
+      - "      dut.rst_n.value = 1"
+      - "      dut.Step(1)"
+      - "      "
+      - "      # 按反例时序驱动引脚"
+      - "      dut.a.value = 0xFF"
+      - "      dut.b.value = 0x01"
+      - "      dut.cin.value = 1"
+      - "      dut.Step(1)"
+      - "      "
+      - "      # 断言：检查预期 vs 实际"
+      - "      expected_sum = 0x101"
+      - "      assert dut.sum.value == expected_sum, \\"
+      - "          f'CK_XXX Bug: 预期 sum={expected_sum:#x}, 实际 sum={dut.sum.value:#x}'"
+      - "      "
+      - "      dut.Finish()"
+      - "  ```"
+      - "第6步：将所有测试函数写入 `{OUT}/tests/test_{DUT}_counterexample.py`。文件顶部需包含 import 语句和文件说明注释。"
+      - "第7步：若 checker.sv 中没有任何 [RTL_BUG] 标记的属性，则生成一个包含以下注释的空测试文件："
+      - "  `# 形式化验证未发现 RTL 缺陷，无需生成反例测试用例`"
+      - "注意事项："
+      - "  - 时钟名和复位名需从 wrapper.sv 的 Clock/Reset Remapping 注释中读取 RTL 原始端口名"
+      - "  - 每个测试函数的 docstring 须包含：对应属性名、Bug描述、反例值"
+      - "  - 断言格式：assert output == expected, '描述信息'"
+      - "  - 每个测试函数末尾须调用 dut.Finish() 释放资源"
+      - "  - 参考 Guide_Doc/dut_counterexample_testcase.md 了解 picker DUT 的完整用法"
+    reference_files:
+      - "Guide_Doc/dut_counterexample_testcase.md"
+      - "{OUT}/tests/{DUT}_checker.sv"
+      - "{OUT}/tests/{DUT}_wrapper.sv"
+      - "{OUT}/tests/avis.log"
+      - "{RTL_PATH}/*.v"
+      - "{RTL_PATH}/*.sv"
+    output_files:
+      - "{OUT}/tests/test_{DUT}_counterexample.py"
+    checker:
+      - name: counterexample_testgen_check
+        clss: "examples.Formal.scripts.formal_checkers.CounterexampleTestgenChecker"
+        args:
+          dut_name: "{DUT}"
+          checker_file: "{OUT}/tests/{DUT}_checker.sv"
+          test_file: "{OUT}/tests/test_{DUT}_counterexample.py"
+          log_file: "{OUT}/tests/avis.log"
+
+  # ========== Stage 10: RTL Defect Analysis and Reporting ==========
+  # (Renumbered from Stage 9 after insertion of counterexample_python_testgen)
   - name: formal_execution
     desc: "RTL缺陷分析与报告"
     task:
@@ -580,7 +651,7 @@ stage:
           log_file: "{OUT}/tests/avis.log"
     ignore: $(IGNORE_STATIC_CHECK: true)
           
-  # ========== Stage 10: Verification Summary and Review ==========
+  # ========== Stage 11: Verification Summary and Review ==========
   - name: verification_review_and_summary
     desc: "验证总结与审查"
     task:
@@ -601,6 +672,7 @@ stage:
       - "{OUT}/tests/avis.log"
       - "{OUT}/tests/avis/fanin.rep"
       - "{OUT}/04_{DUT}_bug_report.md"
+      - "{OUT}/tests/test_{DUT}_counterexample.py"
       - "Guide_Doc/dut_formal_template.md"
     output_files:
       - "{OUT}/05_{DUT}_formal_summary.md"

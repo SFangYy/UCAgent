@@ -101,6 +101,37 @@ def parse_avis_log(log_path: str) -> Dict[str, list]:
     return result
 
 
+def extract_rtl_bug_properties(checker_path: str) -> List[str]:
+    """Extract property names marked with [RTL_BUG] from checker.sv.
+
+    This is the single source of truth for RTL bug extraction, shared by
+    ``BugReportConsistencyChecker`` and ``CounterexampleTestgenChecker``.
+
+    Scans for ``// [RTL_BUG]`` comment markers and extracts the property name
+    from the subsequent ``NAME: assert property(...)`` line (within 5 lines).
+
+    Returns a list of property names, e.g. ``['A_CK_SUM_WIDTH', ...]``.
+    """
+    if not os.path.exists(checker_path):
+        return []
+
+    with open(checker_path, "r", encoding="utf-8", errors="ignore") as f:
+        lines = f.readlines()
+
+    rtl_bugs: List[str] = []
+    for i, line in enumerate(lines):
+        if "[RTL_BUG]" in line:
+            # Search for property definition in subsequent lines (up to 5 lines)
+            for j in range(i, min(i + 6, len(lines))):
+                match = re.search(
+                    r"([A-Z_][A-Z0-9_]*)\s*:\s*assert\s+property", lines[j]
+                )
+                if match:
+                    rtl_bugs.append(match.group(1))
+                    break
+    return rtl_bugs
+
+
 def _terminate_process_tree(proc: subprocess.Popen, timeout: int = 5) -> None:
     """Gracefully terminate a process and all its children."""
     try:

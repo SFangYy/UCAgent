@@ -25,8 +25,8 @@ from ucagent.checkers.base import Checker
 from ucagent.util.log import info, warning
 import psutil
 
-# Shared log parser – single source of truth
-from examples.Formal.scripts.formal_tools import parse_avis_log
+# Shared utilities – single source of truth
+from examples.Formal.scripts.formal_tools import parse_avis_log, extract_rtl_bug_properties
 
 
 # =============================================================================
@@ -424,36 +424,6 @@ class BugReportConsistencyChecker(Checker):
         self.bug_report_file = bug_report_file
         self.log_file = log_file if log_file else f"avis/{self.dut_name}.log"
 
-    def _extract_rtl_defects_from_checker(self, checker_path: str) -> list:
-        """
-        Extracts all properties marked with [RTL_BUG] from checker.sv.
-
-        Format:
-        // [RTL_BUG] Description...
-        A_CK_XXX: assert property(...);
-
-        Returns: List of property names.
-        """
-        if not os.path.exists(checker_path):
-            return []
-
-        with open(checker_path, 'r', encoding='utf-8', errors='ignore') as f:
-            lines = f.readlines()
-
-        rtl_defects = []
-        for i, line in enumerate(lines):
-            # Search for [RTL_BUG] marker
-            if '[RTL_BUG]' in line:
-                # Search for property definition in subsequent lines (up to 5 lines)
-                for j in range(i, min(i + 6, len(lines))):
-                    # Match property_name: assert property(...) or assert property @(...) property_name
-                    match = re.search(r'([A-Z_][A-Z0-9_]*)\s*:\s*assert\s+property', lines[j])
-                    if match:
-                        rtl_defects.append(match.group(1))
-                        break
-
-        return rtl_defects
-
     def do_check(self, timeout=0, **kwargs) -> tuple[bool, object]:
         """
         Validates the consistency between the bug report and RTL defects.
@@ -462,8 +432,8 @@ class BugReportConsistencyChecker(Checker):
         """
         checker_path = self.get_path(self.property_file)
 
-        # Step 1: Extract RTL defects from checker.sv
-        rtl_defects = self._extract_rtl_defects_from_checker(checker_path)
+        # Step 1: Extract RTL defects from checker.sv (shared utility)
+        rtl_defects = extract_rtl_bug_properties(checker_path)
         info(f"Extracted {len(rtl_defects)} properties marked with [RTL_BUG] from checker.sv")
 
         if not rtl_defects:
@@ -1056,6 +1026,188 @@ class EnvironmentDebuggingChecker(Checker):
             result["warning_trivially_true"] = report["warning_trivially_true"]
         else:
             result["message"] = "✅ Environment debugging stage passed"
+        return True, result
+
+# =============================================================================
+# Counterexample Python Test Generation Checker
+# =============================================================================
+
+class CounterexampleTestgenChecker(Checker):
+    """Validates generated Python counterexample test cases for the
+    counterexample_python_testgen stage.
+
+    Checks:
+    1. Test file exists.
+    2. If [RTL_BUG] properties exist in checker.sv, each must have a
+       corresponding ``test_cex_`` function in the test file.
+    3. Each test function must contain at least one ``assert`` statement
+       and a ``dut.Finish()`` call.
+    4. If no [RTL_BUG] properties exist, the test file should contain a
+       "no defects" comment.
+    """
+
+    def __init__(self, dut_name, checker_file, test_file, log_file=None, **kwargs):
+        self.dut_name = dut_name
+        self.checker_file = checker_file
+        self.test_file = test_file
+        self.log_file = log_file
+
+    def _extract_test_functions(self, test_path: str) -> dict:
+        """Extract test function details from the Python test file.
+
+        Returns a dict: { 'test_cex_ck_xxx': {'has_assert': bool, 'has_finish': bool} }
+        """
+        if not os.path.exists(test_path):
+            return {}
+
+        with open(test_path, 'r', encoding='utf-8', errors='ignore') as f:
+            content = f.read()
+
+        functions = {}
+        # Find all test_cex_ function definitions
+        func_pattern = re.compile(r'^def\s+(test_cex_\w+)\s*\(', re.MULTILINE)
+        func_matches = list(func_pattern.finditer(content))
+
+        for idx, match in enumerate(func_matches):
+            func_name = match.group(1)
+            # Get the function body (until the next def or end of file)
+            start = match.start()
+            if idx + 1 < len(func_matches):
+                end = func_matches[idx + 1].start()
+            else:
+                end = len(content)
+            func_body = content[start:end]
+
+            functions[func_name] = {
+                'has_assert': 'assert ' in func_body,
+                'has_finish': 'Finish()' in func_body,
+            }
+
+        return functions
+
+    def do_check(self, timeout=0, **kwargs) -> tuple[bool, object]:
+        """Validates counterexample test file against [RTL_BUG] properties."""
+        checker_path = self.get_path(self.checker_file)
+        test_path = self.get_path(self.test_file)
+
+        # Step 1: Extract RTL bugs from checker.sv
+        rtl_bugs = extract_rtl_bug_properties(checker_path)
+        info(f"Found {len(rtl_bugs)} properties marked with [RTL_BUG]")
+
+        # Step 2: Check test file existence
+        if not os.path.exists(test_path):
+            if not rtl_bugs:
+                return False, {
+                    "error": "❌ Test file does not exist",
+                    "details": (
+                        f"Please create '{self.test_file}'. "
+                        "Since no [RTL_BUG] properties were found, "
+                        "the file should contain a comment: "
+                        "'# 形式化验证未发现 RTL 缺陷，无需生成反例测试用例'"
+                    ),
+                }
+            return False, {
+                "error": "❌ Test file does not exist",
+                "details": (
+                    f"Please create '{self.test_file}' with test functions "
+                    f"for the following {len(rtl_bugs)} [RTL_BUG] properties:"
+                ),
+                "rtl_bugs": rtl_bugs,
+            }
+
+        with open(test_path, 'r', encoding='utf-8', errors='ignore') as f:
+            test_content = f.read()
+
+        # Step 3: No RTL bugs case
+        if not rtl_bugs:
+            # Just verify the file exists and has the no-defects comment
+            if '无需生成反例测试' in test_content or '未发现 RTL 缺陷' in test_content or 'no RTL defect' in test_content.lower():
+                return True, {
+                    "message": "✅ No [RTL_BUG] properties found; test file correctly indicates no defects",
+                }
+            return True, {
+                "message": "✅ No [RTL_BUG] properties found; test file exists",
+                "note": "Consider adding a comment indicating no RTL defects were found",
+            }
+
+        # Step 4: Extract test functions
+        test_funcs = self._extract_test_functions(test_path)
+        if not test_funcs:
+            return False, {
+                "error": f"❌ No test_cex_* functions found in {self.test_file}",
+                "details": (
+                    f"Found {len(rtl_bugs)} [RTL_BUG] properties but no "
+                    "counterexample test functions. Each [RTL_BUG] property "
+                    "needs a corresponding test_cex_* function."
+                ),
+                "rtl_bugs": rtl_bugs,
+            }
+
+        # Step 5: Check coverage — each RTL bug should have a test
+        # Normalize names: A_CK_XXX -> ck_xxx for matching test_cex_ck_xxx
+        errors = []
+
+        # Build a mapping from normalized CK name to test function
+        covered_bugs = set()
+        for bug_prop in rtl_bugs:
+            # Normalize: A_CK_XXX -> ck_xxx
+            normalized = bug_prop.lower()
+            if normalized.startswith('a_'):
+                normalized = normalized[2:]
+
+            # Check if any test function name contains the normalized property name
+            found = False
+            for func_name in test_funcs:
+                # test_cex_ck_xxx should contain ck_xxx
+                if normalized in func_name:
+                    found = True
+                    covered_bugs.add(bug_prop)
+                    break
+
+            if not found:
+                errors.append(
+                    f"Missing test for [RTL_BUG] property '{bug_prop}': "
+                    f"expected a function like 'test_cex_{normalized}'"
+                )
+
+        # Step 6: Validate test function quality
+        quality_warnings = []
+        for func_name, info_dict in test_funcs.items():
+            if not info_dict['has_assert']:
+                errors.append(
+                    f"Function '{func_name}' has no assert statement. "
+                    "Each counterexample test must verify expected vs actual output."
+                )
+            if not info_dict['has_finish']:
+                quality_warnings.append(
+                    f"Function '{func_name}' missing dut.Finish() call. "
+                    "This may cause resource leaks."
+                )
+
+        if errors:
+            result = {
+                "error": f"❌ Counterexample test validation failed ({len(errors)} issues)",
+                "issues": errors,
+                "rtl_bugs_total": len(rtl_bugs),
+                "covered": len(covered_bugs),
+                "test_functions_found": list(test_funcs.keys()),
+            }
+            if quality_warnings:
+                result["warnings"] = quality_warnings
+            return False, result
+
+        # All checks passed
+        result = {
+            "message": (
+                f"✅ Counterexample test generation passed: "
+                f"{len(rtl_bugs)} [RTL_BUG] properties covered by "
+                f"{len(test_funcs)} test functions"
+            ),
+            "rtl_bugs": rtl_bugs,
+            "test_functions": list(test_funcs.keys()),
+        }
+        if quality_warnings:
+            result["warnings"] = quality_warnings
         return True, result
 
 
