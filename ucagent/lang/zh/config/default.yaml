@@ -59,7 +59,7 @@ mission:
       **工作原则：**
       - 按步骤有序进行，每步完成后用`Complete`工具进入下一个阶段
       - 你会根据`CurrentTips`的要求完成该阶段的所有任务，不会提前进行后续阶段的工作，例如编写测试用例
-      - 测试失败时，优先怀疑是芯片设计问题，不是测试问题
+      - 测试用例失败时，优先怀疑是芯片设计问题，不是测试问题
       - 深入分析发现的问题
       - 触发bug对应的测试用例必须 Fail，不能误报为 Pass
       - {DUT}的verilog源代码位于`{DUT}/{DUT}.v`目录下，其依赖或者上层语言的源码位于目录`{RTL_PATH}/`，文件后缀可能是.v、.sv、.vh、.scala等
@@ -98,7 +98,11 @@ mission:
       现在调用`CurrentTips`，开始你的验证工作！
     tips:
       allways:
-        - "你需要通过Complete工具来判断你是否完成了当前阶段的任务"
+        - "阶段任务执行步骤":
+          - "(1) 阅读reference_files列出的参考文档"
+          - "(2) 完成目标任务"
+          - "(3) 通过SetCurrentStageJournal记录日志"
+          - "(4) 通过Complete工具确认完成当前阶段的任务"
         - "你需要完成所有阶段的任务，才算完成整个验证任务"
         - "不清楚目标时，需要通过工具RoleInfo获取角色信息和基本指导"
       random:
@@ -129,7 +133,7 @@ stage:
       - "第3步：识别风险点 - 哪些地方容易出错？边界条件有哪些？"
       - "第4步：制定验证计划 - 如何系统地测试所有功能？"
       - "第5步：写入验证规划文档到{OUT}/{DUT}_verification_needs_and_plan.md，请使用{DOC_GEN_LANG}编写"
-      - "注意：{DUT}中可能有隐藏bug，测试失败时不要尝试修复{DUT}的实现，而是分析是否为设计缺陷并进行记录"
+      - "注意：{DUT}中可能有隐藏bug，测试用例失败时不要尝试修复{DUT}的实现，而是分析是否为设计缺陷并进行记录"
     reference_files:
       - "{DUT}/README.md"
     # skill_list:
@@ -266,7 +270,7 @@ stage:
       - ""
       - "=== 关于 <FG-*>/<FC-*>/<CK-*> 标签的来源（重要）==="
       - "  {OUT}/{DUT}_static_bug_analysis.md 中使用的所有 <FG-*>/<FC-*>/<CK-*> 标签"
-      - "  必须来自 {OUT}/{DUT}_functions_and_checks.md，不得凭空创造。"
+      - "  必须来自 {OUT}/{DUT}_functions_and_checks.md，不得凭空创造，(FG-NULL, FC-NULL, CK-NULL 标签除外)。"
       - "  操作流程："
       - "    a) 先查阅 {OUT}/{DUT}_functions_and_checks.md，确认目标 <FG-*>/<FC-*>/<CK-*> 是否存在"
       - "    b) 若已存在：直接在 static_bug_analysis.md 中使用，标签必须与 functions_and_checks.md 完全一致（区分大小写）"
@@ -303,13 +307,12 @@ stage:
       - "          42: assign sum = a + b;       // BUG：忽略了cin，位宽不足"
       - "          ```"
       - ""
-      - "=== 示例——未发现Bug ==="
-      - "  <FG-ALU>"
-      - "  #### 减法功能 <FC-SUB>"
-      - "  - <CK-BORROW> 借位信号正确 <BG-STATIC-000-NULL>"
-      - "  （注意：<BG-STATIC-000-NULL> 下面不允许有任何 <LINK-BUG-*> 或 <FILE-*> 子标签）"
+      - "=== 示例——未发现Bug(在所有文件中都未发现任何bug) ==="
+      - "  <FG-NULL><FC-NULL><CK-NULL>所有文件都没发现Bug<BG-STATIC-NULL>"
+      - "  （注意：BG-STATIC-NULL 下面不允许有任何 <LINK-BUG-*> 或 <FILE-*> 子标签）"
       - ""
       - "=== 关键规则 ==="
+      - "  - 标签仅仅在标记的时候需要用尖括号包裹(<tag_name>，即文档中只能用尖括号包裹一次)，后续引用时无需尖括号，否则将报错"
       - "  - 【来源】所有 <FG-*>/<FC-*>/<CK-*> 必须来自 {OUT}/{DUT}_functions_and_checks.md；不存在的须先添加到该文件再使用"
       - "  - 【多Bug】一个 <CK-*> 下可以有多个 <BG-STATIC-*> 标签，每个代表一个独立Bug"
       - "  - 每个 <BG-STATIC-*>（NULL除外）必须有且仅有一个 <LINK-BUG-[BG-TBD]> 子标签"
@@ -317,7 +320,7 @@ stage:
       - "  - FILE格式：<FILE-相对路径/文件.v:L1-L2>（相对workspace根目录，示例：rtl/dut.v:50-56）"
       - "    多段范围示例：<FILE-rtl/dut.v:50-56,100-105>"
       - "  - 所有 <FG-*>/<FC-*>/<CK-*> 标签必须与 functions_and_checks.md 中的定义完全一致（区分大小写）"
-      - "  - <BG-STATIC-000-NULL> 是唯一可以没有子标签的Bug条目"
+      - "  - <BG-STATIC-NULL> 是唯一可以没有子标签的Bug条目，且仅用于表示在所有文件中都未发现任何Bug（不能应用于单文件没发现任何Bug）"
       - ""
       - "=== 批次进度追踪（必须写在 {OUT}/{DUT}_static_bug_analysis.md 末尾）==="
       - "  本批次分析完毕后，将每个已分析文件追加到 '## 批次分析进度' 表格中。若该章节不存在则先创建："
@@ -338,7 +341,6 @@ stage:
       - "  - 若未找到任何RTL源文件（黑盒验证场景），直接在{OUT}/{DUT}_static_bug_analysis.md中说明：无源文件可供静态分析，验证以黑盒方式进行，无需执行上述分析步骤"
     reference_files:
       - "Guide_Doc/dut_bug_analysis.md"
-      - "{DUT}/__init__.py"
       - "{OUT}/{DUT}_functions_and_checks.md"
       - "{OUT}/{DUT}_basic_info.md"
     output_files:
@@ -354,7 +356,7 @@ stage:
             - "{RTL_PATH}/**/*.v"
             - "{RTL_PATH}/**/*.sv"
             - "{RTL_PATH}/**/*.scala"
-          batch_size: 1
+          batch_size: $(STATIC_ANALYSIS_BATCH_SIZE: 1) # 根据DUT复杂度调整批次大小，建议初始值为1（即每次分析一个文件），复杂DUT可适当增加以提升效率，但过大可能导致分析质量下降
     need_human_check: false
 
   - name: dut_wrapper_implementation
@@ -843,7 +845,7 @@ stage:
     desc: "全面验证与缺陷分析"
     task:
       - "目标：将测试模板填充为真实测试，发现并分析芯片bug"
-      - "重要：测试失败时，优先怀疑是芯片设计问题，不要急于修改测试。可能在测试过程中发现覆盖率中的检查点有误，需进行相应调整"
+      - "重要：测试用例失败时，优先怀疑是芯片设计问题，不要急于修改测试。可能在测试过程中发现覆盖率中的检查点有误，需进行相应调整"
       - "参考Guide_Doc/dut_test_case.md和dut_bug_analysis.md了解实现方法"
       - "上述过程中，可能发现之前步骤中需要修正，你需要进行相应的调整，例如完善api、功能覆盖等"
       - "注意："

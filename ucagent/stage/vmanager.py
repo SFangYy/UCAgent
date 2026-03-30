@@ -670,6 +670,7 @@ class StageManager(object):
                 rindex = random.randint(0, len(random_tips) - 1)
                 current_tips.append(random_tips[rindex])
             if current_tips:
+                random.shuffle(current_tips)
                 tips["tips"] = current_tips
         tips = make_llm_tool_ret(tips)
         return self.attach_todo_summary(tips)
@@ -847,6 +848,7 @@ class StageManager(object):
         self._go_skip_stage()
         self._refresh_all_completed()
         self.save_stage_info()
+        return self.get_current_stage()
 
     def _go_skip_stage(self):
         if self.stage_index >= len(self.stages):

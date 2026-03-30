@@ -69,11 +69,16 @@ _RE_BRACKET_TAG = re.compile(
     r'\[BG-([A-Za-z][A-Za-z0-9_-]+-\d{1,3})\]', re.IGNORECASE
 )
 
-# Key value for <BG-STATIC-000-NULL>: no bugs found after review
+# Key value for <BG-STATIC-NULL>: no bugs found after review
 # parse_nested_keys keeps the key-prefix in the extracted value, so the
-# dict key for <BG-STATIC-000-NULL> is "BG-STATIC-000-NULL" and the path
+# dict key for <BG-STATIC-NULL> is "BG-STATIC-NULL" and the path
 # segment returned by nested_keys_as_list is exactly this string.
-_NULL_SENTINEL_KEY = "BG-STATIC-000-NULL"
+_NULL_SENTINEL_KEY = "BG-STATIC-NULL"
+
+# NULL sentinel path components for FG/FC/CK
+_NULL_FG_KEY = "FG-NULL"
+_NULL_FC_KEY = "FC-NULL"
+_NULL_CK_KEY = "CK-NULL"
 
 # <FILE-filepath:linerange> — source file location evidence for a static bug.
 # filepath : any non-empty path string (no whitespace, relative to project root)
@@ -114,7 +119,7 @@ def _check_ck_paths_against_fc_doc(
         return errors  # no CK tags in static doc — nothing to cross-check
 
     try:
-        fc_ck_paths: set = set(fc.get_unity_chip_doc_marks(fc_path, "CK"))
+        fc_ck_paths = fc.get_unity_chip_doc_marks(fc_path, "CK")
     except (AssertionError, ValueError) as e:
         errors.append(
             f"Failed to parse '{fc_doc_name}' for CK tag cross-reference: {e}. "
@@ -122,18 +127,35 @@ def _check_ck_paths_against_fc_doc(
         )
         return errors
 
+    diff_ck_path = []
+    related_fc_ck_paths = {k:0 for k in fc_ck_paths}
     for ck_path in ck_klist:
+        # Skip NULL sentinel path - FG-NULL/FC-NULL/CK-NULL is a special case
+        # that doesn't need to exist in functions_and_checks.md
+        if ck_path == f"{_NULL_FG_KEY}/{_NULL_FC_KEY}/{_NULL_CK_KEY}":
+            continue
         if ck_path not in fc_ck_paths:
-            parts = ck_path.split("/")
-            fg_tag = f"<FG-{parts[0]}>" if len(parts) > 0 else "?"
-            fc_tag = f"<FC-{parts[1]}>" if len(parts) > 1 else "?"
-            ck_tag = f"<CK-{parts[2]}>" if len(parts) > 2 else "?"
-            errors.append(
-                f"Tag '{ck_tag}' (path: {fg_tag}/{fc_tag}/{ck_tag}) used in the static "
-                f"bug doc is not found in '{fc_doc_name}'. "
-                f"Add this tag hierarchy to '{fc_doc_name}' first, or fix the tag name "
-                f"in the static bug doc to match an existing entry."
-            )
+            related_fc_ck_paths[fc.find_most_similar_strings(ck_path, fc_ck_paths)] += 1
+            diff_ck_path.append(ck_path)
+    if len(diff_ck_path) > 0:
+        parts = diff_ck_path[-1].split("/")
+        fg_tag = f"<{parts[0]}>" if len(parts) > 0 else "?"
+        fc_tag = f"<{parts[1]}>" if len(parts) > 1 else "?"
+        ck_tag = f"<{parts[2]}>" if len(parts) > 2 else "?"
+        # CK tags are defined in the static bug doc, but not found in the FC doc
+        errors.append({f"The following CK tags defined in the static bug doc are not found in {fc_doc_name}": diff_ck_path})
+        errors.append(
+            f"The CK tag hierarchy in doc is like: {fg_tag} ... {fc_tag} ... {ck_tag}. "
+            f"You need first to fix the tag name to match the existing entry, or add the new tag hierarchy to `{fc_doc_name}`."
+        )
+        # sort related_fc_ck_paths by value
+        all_ck_count = len(related_fc_ck_paths)
+        max_ck_list = max(10, len(diff_ck_path))
+        sorted_fc_ck_paths = sorted(related_fc_ck_paths.items(), key=lambda x: x[1], reverse=True)[:max_ck_list]
+        sorted_fc_ck_paths = [k for k, _ in sorted_fc_ck_paths]
+        if all_ck_count > max_ck_list:
+            sorted_fc_ck_paths.append(f"... {all_ck_count - max_ck_list} more")
+        errors.append({f"There are {all_ck_count} existing CK tags in {fc_doc_name}": sorted_fc_ck_paths})
     return errors
 
 
@@ -191,7 +213,7 @@ class UnityChipCheckerStaticBugFormat(Checker):
         self.static_doc               = static_doc
         self.functions_and_checks_doc = functions_and_checks_doc
 
-    def do_check(self, timeout=0, **kw) -> Tuple[bool, object]:
+    def do_check(self, timeout=0, empty_is_ok=False, **kw) -> Tuple[bool, object]:
         """Validate static bug tag format and mandatory LINK-BUG/FILE child tags."""
         real_path = self.get_path(self.static_doc)
         if not os.path.exists(real_path):
@@ -218,23 +240,25 @@ class UnityChipCheckerStaticBugFormat(Checker):
         # ── get all LINK-BUG leaf entries ────────────────────────────────────
         klist, blist = fc.nested_keys_as_list(data, "LINK-BUG", _STATIC_KEYNAMES)
 
-        # <BG-STATIC-000-NULL> has no LINK-BUG child, so it appears in blist.
+        # <BG-STATIC-NULL> has no LINK-BUG child, so it appears in blist.
         # Separate it from genuinely broken entries.
         null_entries = [item for item in blist if item[1].split("/")[-1] == _NULL_SENTINEL_KEY]
         real_broken  = [item for item in blist if item[1].split("/")[-1] != _NULL_SENTINEL_KEY]
 
         # ── no BG-STATIC tags at all ──────────────────────────────────────────
         if not klist and not blist:
+            if empty_is_ok:
+                return True, {"message": "No static bugs recorded."}
             return False, {
                 "error": (
                     f"No <BG-STATIC-*> tags found in '{self.static_doc}'. "
                     "Static analysis result must be explicitly recorded. "
-                    "If no bugs were found, add <BG-STATIC-000-NULL> under a <CK-*> tag. "
+                    "If no bugs were found in any file, add <FG-NULL><FC-NULL><CK-NULL><BG-STATIC-NULL>. "
                     "If bugs were found, add <BG-STATIC-NNN-NAME> tags each with a "
                     "<LINK-BUG-[BG-TBD]> child tag."
                 ),
                 "check_list": [
-                    "No bugs found: add <BG-STATIC-000-NULL> under a <CK-*> tag "
+                    "No bugs found in any file: add <FG-NULL><FC-NULL><CK-NULL><BG-STATIC-NULL> "
                     "(no <LINK-BUG-*> child needed)",
                     "Bugs found: use <BG-STATIC-NNN-NAME> tags, each with a <LINK-BUG-[BG-TBD]> child",
                     "See Guide_Doc/dut_bug_analysis.md for the full format specification",
@@ -256,19 +280,32 @@ class UnityChipCheckerStaticBugFormat(Checker):
 
         # ── NULL sentinel only, no real bugs ──────────────────────────────────
         if null_entries and not klist and not real_broken:
+            # Validate that BG-STATIC-NULL is used with FG-NULL/FC-NULL/CK-NULL
+            for _, path, _ in null_entries:
+                parts = path.split("/")
+                if len(parts) >= 4:
+                    fg_key = parts[0]
+                    fc_key = parts[1]
+                    ck_key = parts[2]
+                    if fg_key != _NULL_FG_KEY or fc_key != _NULL_FC_KEY or ck_key != _NULL_CK_KEY:
+                        errors.append(
+                            f"<BG-STATIC-NULL> must be used with <FG-NULL><FC-NULL><CK-NULL>, "
+                            f"but found path: <{fg_key}><{fc_key}><{ck_key}><BG-STATIC-NULL>. "
+                            f"When no bugs are found in any file, use: "
+                            f"<FG-NULL><FC-NULL><CK-NULL><BG-STATIC-NULL>."
+                        )
             if errors:
                 return False, {
                     "error": errors,
                     "check_list": [
-                        "Ensure all <CK-*> tags used in the static doc exist in "
-                       f"'{self.functions_and_checks_doc}'",
+                        "<BG-STATIC-NULL> must be used with <FG-NULL><FC-NULL><CK-NULL>",
                         "See Guide_Doc/dut_bug_analysis.md for the full format specification",
                     ],
                 }
             return True, {
                 "message": (
                     f"UnityChipCheckerStaticBugFormat passed: "
-                    f"<BG-STATIC-000-NULL> sentinel confirmed — "
+                    f"<BG-STATIC-NULL> sentinel confirmed — "
                     f"no static bugs found after review."
                 ),
                 "static_bug_count": 0,
@@ -277,8 +314,8 @@ class UnityChipCheckerStaticBugFormat(Checker):
         # ── NULL sentinel mixed with real bugs ────────────────────────────────
         if null_entries:
             errors.append(
-                "<BG-STATIC-000-NULL> must not coexist with real <BG-STATIC-*> bug entries. "
-                "Remove <BG-STATIC-000-NULL> when actual bugs are documented."
+                "<BG-STATIC-NULL> must not coexist with real <BG-STATIC-*> bug entries. "
+                "Remove <BG-STATIC-NULL> when actual bugs are documented."
             )
 
         # ── broken real entries (missing LINK-BUG child) ──────────────────────
@@ -301,7 +338,7 @@ class UnityChipCheckerStaticBugFormat(Checker):
                 )
         # ── FILE tag presence and format ──────────────────────────────────
         # LINK-BUG entries without FILE children appear in file_blist with
-        # item[0] == "LINK-BUG"; BG-STATIC-000-NULL entries have item[0] == "BG-STATIC"
+        # item[0] == "LINK-BUG"; BG-STATIC-NULL entries have item[0] == "BG-STATIC"
         file_klist, file_blist = fc.nested_keys_as_list(data, "FILE", _STATIC_KEYNAMES)
         for _, path, _ in (item for item in file_blist if item[0] == "LINK-BUG"):
             errors.append(
@@ -346,8 +383,8 @@ class UnityChipCheckerStaticBugFormat(Checker):
                     "(one per discovered bug)",
                     "FILE format: <FILE-path/to/file.v:50-56> or <FILE-path/to/file.v:50-56,100-120>",
                     "LINK-BUG format: <LINK-BUG-[BG-TBD]> (pending), placed on its own line",
-                    "<BG-STATIC-000-NULL> declares no bugs found and must not coexist with "
-                    "real bug entries",
+                    "<BG-STATIC-NULL> declares no bugs found in any file and must be used with "
+                    "<FG-NULL><FC-NULL><CK-NULL>; it must not coexist with real bug entries",
                     f"All <CK-*> tags in the static doc must exist in "
                     f"'{self.functions_and_checks_doc}'",
                     "See Guide_Doc/dut_bug_analysis.md for the full format specification",
@@ -438,18 +475,29 @@ class UnityChipCheckerStaticBugValidation(Checker):
 
         # ── NULL sentinel only — nothing further to validate ─────────────────
         if null_entries and not klist and not real_broken:
+            # Validate that BG-STATIC-NULL is used with FG-NULL/FC-NULL/CK-NULL
+            for _, path, _ in null_entries:
+                parts = path.split("/")
+                if len(parts) >= 4:
+                    fg_key = parts[0]
+                    fc_key = parts[1]
+                    ck_key = parts[2]
+                    if fg_key != _NULL_FG_KEY or fc_key != _NULL_FC_KEY or ck_key != _NULL_CK_KEY:
+                        errors.append(
+                            f"<BG-STATIC-NULL> must be used with <FG-NULL><FC-NULL><CK-NULL>, "
+                            f"but found path: <{fg_key}><{fc_key}><{ck_key}><BG-STATIC-NULL>."
+                        )
             if errors:
                 return False, {
                     "error": errors,
                     "check_list": [
-                        f"Ensure all <CK-*> tags in the static doc exist in "
-                        f"'{self.functions_and_checks_doc}'",
+                        "<BG-STATIC-NULL> must be used with <FG-NULL><FC-NULL><CK-NULL>",
                     ],
                 }
             return True, {
                 "message": (
                     f"UnityChipCheckerStaticBugValidation passed: "
-                    f"<BG-STATIC-000-NULL> sentinel confirmed — no static bugs to validate."
+                    f"<BG-STATIC-NULL> sentinel confirmed — no static bugs to validate."
                 ),
                 "confirmed_count": 0,
             }
@@ -457,7 +505,7 @@ class UnityChipCheckerStaticBugValidation(Checker):
         # ── NULL sentinel mixed with real bugs ────────────────────────────────
         if null_entries:
             errors.append(
-                "<BG-STATIC-000-NULL> must not coexist with real <BG-STATIC-*> bug entries."
+                "<BG-STATIC-NULL> must not coexist with real <BG-STATIC-*> bug entries."
             )
 
         # ── broken real entries (BG-STATIC without LINK-BUG) ─────────────────
@@ -612,7 +660,13 @@ class UnityChipBatchCheckerStaticBug(Checker):
         self.functions_and_checks_doc = functions_and_checks_doc
         self.file_list = file_list if isinstance(file_list, list) else [file_list]
         self.batch_size = batch_size
-        self.batch_task = UnityChipBatchTask("source_files", self)
+        self.batch_task = UnityChipBatchTask("RTL_file_to_analyze", self)
+        self.fmt_checker = UnityChipCheckerStaticBugFormat(self.static_doc, self.functions_and_checks_doc)
+
+    def set_workspace(self, workspace: str):
+        super().set_workspace(workspace)
+        self.fmt_checker.set_workspace(workspace)
+        return self
 
     # ── internal helpers ─────────────────────────────────────────────────────
 
@@ -765,116 +819,31 @@ class UnityChipBatchCheckerStaticBug(Checker):
         self.batch_task.sync_gen_task(
             gen, note_msg, "Analyzed files updated from document."
         )
-
-        total = len(self.batch_task.source_task_list)
-        analyzed_count = len(self.batch_task.gen_task_list)
-
         passed, result = self.batch_task.do_complete(
             note_msg, is_complete,
             f"in source file patterns {self.file_list}",
             f"in {self.static_doc} <file> progress tags",
-            " Refer to the 'task' field for detailed analysis steps.",
+            " Please use tool `CurrentFileTips` to get detailed task description.",
         )
-
-        # ── All files analyzed — run format validation ────────────────────────
-        if passed:
-            fmt_checker = UnityChipCheckerStaticBugFormat(
-                self.static_doc, self.functions_and_checks_doc
-            )
-            fmt_checker.set_workspace(self.workspace)
-            fmt_passed, fmt_result = fmt_checker.do_check(**kw)
-            if fmt_passed and isinstance(fmt_result, dict):
-                fmt_result["analysis_progress"] = f"{analyzed_count}/{total}"
-                fmt_result["analyzed_files"] = self.batch_task.gen_task_list
-            return fmt_passed, fmt_result
-
-        # ── Files remaining — enrich result with analysis task details ────────
-        current_batch = self.batch_task.tbd_task_list
-        remaining = total - analyzed_count
-
-        if isinstance(result, dict) and current_batch:
-            result["task"] = [
-                f"Perform static bug analysis on the following {len(current_batch)} source file(s) "
-                f"and record any findings in {self.static_doc}:",
-                *[f"  - {f}" for f in current_batch],
-                "",
-                "Analysis steps:",
-                "  1. Read the source file(s) and understand the module structure and data flow.",
-                "  2. Cross-reference each <CK-*> check-point in functions_and_checks.md against the RTL implementation.",
-                "  3. Systematically check: FSM completeness, arithmetic overflow, reset/clock logic, interface protocols, control paths.",
-                "  4. Record findings in the static bug analysis document using the STRICT tag hierarchy below.",
-                "  5. If no bugs are found for a check-point, add <BG-STATIC-000-NULL> under the corresponding <CK-*>.",
-                "  6. For high/medium confidence bugs, add new <CK-*> check-points to functions_and_checks.md.",
-                "",
-                f"=== SOURCE OF <FG-*>/<FC-*>/<CK-*> TAGS (important) ===",
-                f"  All <FG-*>, <FC-*>, and <CK-*> tags used in {self.static_doc}",
-                f"  MUST come from {self.functions_and_checks_doc} — do NOT invent new ones.",
-                "  Workflow:",
-                f"    a) Check {self.functions_and_checks_doc} first to see if the target <FG-*>/<FC-*>/<CK-*> exists.",
-                f"    b) If it exists: use it as-is in {self.static_doc} (case-sensitive, exact match).",
-                "    c) If it does NOT exist (e.g. you found a defect not covered by any check-point):",
-                f"       First add the new <FG-*>/<FC-*>/<CK-*> entry to {self.functions_and_checks_doc},",
-                f"       then record the bug under that tag in {self.static_doc}.",
-                "",
-                "=== TAG HIERARCHY (mandatory — must not deviate) ===",
-                "  <FG-*>          functional group  (e.g. <FG-ARITHMETIC>)   ← from functions_and_checks.md",
-                "  └─ <FC-*>       sub-feature        (e.g. <FC-ADD>)          ← from functions_and_checks.md",
-                "     └─ <CK-*>    check-point        (e.g. <CK-OVERFLOW>)     ← from functions_and_checks.md (add if missing)",
-                "        └─ <BG-STATIC-NNN-NAME>   bug entry  (e.g. <BG-STATIC-001-ADD-OVERFLOW>)",
-                "           └─ <LINK-BUG-[BG-TBD]>            exactly one, marks bug as pending",
-                "              └─ <FILE-path:L1-L2>            one or more, source location",
-                "",
-                "=== EXAMPLE — bug found ===",
-                "  <FG-ALU>",
-                "  #### Addition <FC-ADD>",
-                "  - <CK-OVERFLOW> Overflow flag not asserted on carry-out <BG-STATIC-001-ADD-OVERFLOW>",
-                "    - <LINK-BUG-[BG-TBD]>",
-                "      - <FILE-rtl/alu.v:25-30>",
-                "        ```verilog",
-                "        // rtl/alu.v lines 25-30",
-                "        25: assign overflow = carry;   // BUG: missing cin contribution",
-                "        ```",
-                "      - <FILE-rtl/alu.v:42-44>",
-                "        ```verilog",
-                "        // rtl/alu.v lines 42-44",
-                "        42: assign sum = a + b;        // BUG: cin ignored",
-                "        ```",
-                "",
-                "=== EXAMPLE — no bug found ===",
-                "  <FG-ALU>",
-                "  #### Subtraction <FC-SUB>",
-                "  - <CK-BORROW> Borrow signal correct <BG-STATIC-000-NULL>",
-                "  (NOTE: <BG-STATIC-000-NULL> must have NO <LINK-BUG-*> or <FILE-*> child tags)",
-                "",
-                "=== CRITICAL RULES ===",
-                f"  - [SOURCE] All <FG-*>/<FC-*>/<CK-*> MUST originate from {self.functions_and_checks_doc}.",
-                f"    If a required tag is absent, add it to {self.functions_and_checks_doc} first, then use it here.",
-                "  - Every <BG-STATIC-*> (except NULL) needs EXACTLY ONE <LINK-BUG-[BG-TBD]> child.",
-                "  - Every <LINK-BUG-[BG-TBD]> needs AT LEAST ONE <FILE-path:L1-L2> child.",
-                "  - FILE format: <FILE-relative/path/to/file.v:L1-L2>  (workspace-relative, e.g. rtl/dut.v:50-56)",
-                "    Multiple ranges: <FILE-rtl/dut.v:50-56,100-105>",
-                "  - All <FG-*>/<FC-*>/<CK-*> tags MUST exactly match those in functions_and_checks.md (case-sensitive).",
-                "  - <BG-STATIC-000-NULL> is the ONLY tag that may appear without child tags.",
-                "",
-                f"=== BATCH PROGRESS TRACKING (required at end of {self.static_doc}) ===",
-                "After finishing this batch, append each analyzed file to the '## Batch Analysis Progress'",
-                f"table at the END of {self.static_doc}. Create the section if it does not exist yet:",
-                "",
-                "  ## Batch Analysis Progress",
-                "",
-                "  | Source file | Potential bugs | Status |",
-                "  |-------------|---------------|--------|",
-                "  | <file>rtl/dut.v</file> | 2 | ✅ Done |",
-                "",
-                "  IMPORTANT: The path inside <file>…</file> MUST be the workspace-relative source file path",
-                "  (e.g. <file>rtl/dut.v</file>). The batch checker uses these tags to detect completed files.",
-                "",
-                "  DO NOT confuse the two marker types:",
-                "    <file>path</file>  — lowercase, plain text — progress table only, no attributes",
-                "    <FILE-path:L1-L2> — uppercase with colon+lines — bug source location inside LINK-BUG",
-            ]
+        # Add current_batch to result for LLM prompts
+        current_batch = list(self.batch_task.tbd_task_list)
+        progress = f"{len(gen)}/{len(all_files)}"
+        remaining_files = len(all_files) - len(gen)
+        if isinstance(result, dict):
             result["current_batch"] = current_batch
-            result["progress"] = f"{analyzed_count}/{total}"
-            result["remaining_files"] = remaining
-
+            result["progress"] = progress
+            result["remaining_files"] = remaining_files
+            result["analyzed_files"] = len(gen)
+            result["analysis_progress"] = progress
+            result["task"] = current_batch
+        kw["empty_is_ok"] = not passed
+        fmt_passed, fmt_result = self.fmt_checker.do_check(**kw)
+        if not fmt_passed:
+            # Add batch info to fmt_result even on failure
+            if isinstance(fmt_result, dict):
+                fmt_result["current_batch"] = current_batch
+                fmt_result["progress"] = progress
+                fmt_result["remaining_files"] = remaining_files
+                fmt_result["task"] = current_batch
+            return fmt_passed, fmt_result
         return passed, result

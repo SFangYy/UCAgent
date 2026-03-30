@@ -1748,11 +1748,17 @@ def get_coverage_data_path(request, new_path:bool):
 """
 
 
-def make_llm_tool_ret(ret):
+def make_llm_tool_ret(ret, check_pass=True):
     """Convert the return value to a LLM tool return format."""
     if isinstance(ret, str):
         return ret
-    return yam_str(ret)
+    ret_str =  yam_str(ret)
+    if isinstance(ret, dict) and check_pass:
+        for k in ["check_pass", "complete"]:
+            if not ret.get(k, True):
+                ret_str += "\n[Important]\nYou MUST check the error messages (or suggestions) above, and fix it."
+                break
+    return ret_str
 
 
 def list_str_abbr(data: list, max_items=50):
@@ -2334,3 +2340,42 @@ def copy_skill_files(cfg, workspace,root_dir):
                 warning(f"Failed to copy skills: {e}")
         else:
             info(f"Skills not found at {path}, skipping")
+
+
+def find_most_similar_strings(a: Union[str, List[str]], b: List[str]) -> Union[int, List[Tuple[str, int]]]:
+    """
+    Find the index of the most similar string in array b.
+    If input a is a single string, returns the index directly.
+    If input a is a list of strings, returns list of (string, index) tuples.
+
+    Args:
+        a: Single string or list of strings to be matched
+        b: List of candidate strings to compare against
+
+    Returns:
+        The most similar string if a is single string,
+        or list of tuples (string_from_a, index_of_most_similar_in_b) if a is list
+    """
+    import difflib
+    # Handle single string input case
+    if isinstance(a, str):
+        max_similarity = -1
+        best_index = 0
+        for idx, b_item in enumerate(b):
+            similarity = difflib.SequenceMatcher(None, a, b_item).ratio()
+            if similarity > max_similarity:
+                max_similarity = similarity
+                best_index = idx
+        return b[best_index]
+    # Handle list input case
+    result = []
+    for a_item in a:
+        max_similarity = -1
+        best_index = 0
+        for idx, b_item in enumerate(b):
+            similarity = difflib.SequenceMatcher(None, a_item, b_item).ratio()
+            if similarity > max_similarity:
+                max_similarity = similarity
+                best_index = idx
+        result.append((a_item, best_index))
+    return result
