@@ -50,7 +50,7 @@ fanin -cover -list -dump
 # Pure Tcl VCD Patcher for 'surfer' compatibility
 # ==============================================================================
 
-proc find_files_recursively {basedir_pattern} {{
+proc find_files_recursively {{basedir pattern}} {{
     set filelist {{}}
     # Use a simple, non-recursive glob to get all items in the current directory
     set items [glob -nocomplain [file join $basedir *]]

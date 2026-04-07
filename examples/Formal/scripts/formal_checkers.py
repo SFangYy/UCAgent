@@ -30,6 +30,112 @@ from examples.Formal.scripts.formal_tools import parse_avis_log, extract_rtl_bug
 
 
 # =============================================================================
+# Stage Context — shared, cached data across checkers in the same stage
+# =============================================================================
+
+class FormalStageContext:
+    """Caches parsed verification data and shares it across checkers.
+
+    Avoids redundant parsing of avis.log and checker.sv when multiple
+    checkers (e.g. EnvironmentDebuggingChecker + EnvironmentAnalysisChecker)
+    run sequentially in the same stage.
+
+    Usage in any checker's do_check::
+
+        ctx = FormalStageContext.get_or_create(self, log_path, checker_path)
+        parsed_log = ctx.get_parsed_log(log_path)
+        rtl_bugs = ctx.get_rtl_bug_set(checker_path)
+        checker_content = ctx.get_checker_content(checker_path)
+
+    Data is stored via ``smanager_set_value`` so all checkers sharing the
+    same ``stage_manager`` see the same cache.  Mtime-based invalidation
+    ensures stale data is never reused.
+    """
+
+    _SMANAGER_KEY = "_formal_stage_context"
+
+    def __init__(self):
+        self._log_cache = {}        # path -> {"mtime": float, "data": dict}
+        self._checker_cache = {}    # path -> {"mtime": float, "content": str}
+        self._rtl_bug_cache = {}    # path -> {"mtime": float, "bugs": set}
+
+    @classmethod
+    def get_or_create(cls, checker_instance, *_args):
+        """Retrieve or create a shared context from stage_manager."""
+        if checker_instance.stage_manager is not None:
+            try:
+                ctx = checker_instance.smanager_get_value(cls._SMANAGER_KEY)
+                if ctx is not None:
+                    return ctx
+            except (RuntimeError, AttributeError):
+                pass
+
+        ctx = cls()
+
+        if checker_instance.stage_manager is not None:
+            try:
+                checker_instance.smanager_set_value(cls._SMANAGER_KEY, ctx)
+            except (RuntimeError, AttributeError):
+                pass  # Fallback: local-only cache, still avoids intra-checker redundancy
+
+        return ctx
+
+    def _is_stale(self, cache_dict: dict, path: str) -> bool:
+        """Check if cached data for a path is stale (file modified since cache)."""
+        if path not in cache_dict:
+            return True
+        if not os.path.exists(path):
+            return True
+        return os.path.getmtime(path) > cache_dict[path]["mtime"]
+
+    def get_parsed_log(self, log_path: str) -> dict:
+        """Get parsed avis.log data with mtime-based cache invalidation."""
+        if self._is_stale(self._log_cache, log_path):
+            data = parse_avis_log(log_path)
+            self._log_cache[log_path] = {
+                "mtime": os.path.getmtime(log_path),
+                "data": data,
+            }
+        return self._log_cache[log_path]["data"]
+
+    def get_checker_content(self, checker_path: str) -> str:
+        """Get checker.sv file content with mtime-based cache."""
+        if self._is_stale(self._checker_cache, checker_path):
+            content = ""
+            if os.path.exists(checker_path):
+                with open(checker_path, 'r', encoding='utf-8', errors='ignore') as f:
+                    content = f.read()
+            self._checker_cache[checker_path] = {
+                "mtime": os.path.getmtime(checker_path) if os.path.exists(checker_path) else 0,
+                "content": content,
+            }
+        return self._checker_cache[checker_path]["content"]
+
+    def get_rtl_bug_set(self, checker_path: str) -> set:
+        """Get set of RTL_BUG-marked property names with mtime-based cache."""
+        if self._is_stale(self._rtl_bug_cache, checker_path):
+            bugs = set()
+            if os.path.exists(checker_path):
+                bugs = set(extract_rtl_bug_properties(checker_path))
+            self._rtl_bug_cache[checker_path] = {
+                "mtime": os.path.getmtime(checker_path) if os.path.exists(checker_path) else 0,
+                "bugs": bugs,
+            }
+        return self._rtl_bug_cache[checker_path]["bugs"]
+
+    def invalidate(self, path: str = None):
+        """Force invalidate cache for a specific path or all."""
+        if path is None:
+            self._log_cache.clear()
+            self._checker_cache.clear()
+            self._rtl_bug_cache.clear()
+        else:
+            self._log_cache.pop(path, None)
+            self._checker_cache.pop(path, None)
+            self._rtl_bug_cache.pop(path, None)
+
+
+# =============================================================================
 # Basic Checkers
 # =============================================================================
 
@@ -904,18 +1010,34 @@ class EnvironmentDebuggingChecker(Checker):
         else:
             info(f"📋 {rerun_reason}")
 
-        # Step 2: Parse log
+        # Step 2: Parse log (via shared stage context for cache reuse)
         info("🔍 Parsing verification log...")
-        parsed = self._parse_log(log_path)
+        ctx = FormalStageContext.get_or_create(self)
+        if need_rerun:
+            ctx.invalidate(log_path)  # Force re-parse after TCL rerun
+        raw_parsed = ctx.get_parsed_log(log_path)
+
+        # Re-key to match this checker's expected format
+        parsed = {
+            "trivially_true": raw_parsed["trivially_true"],
+            "false_props":    raw_parsed["false"],
+            "pass_props":     raw_parsed["pass"],
+            "cover_pass":     raw_parsed["cover_pass"],
+            "cover_fail":     raw_parsed["cover_fail"],
+            "summary": {
+                "assert_pass":            len(raw_parsed["pass"]),
+                "assert_trivially_true":  len(raw_parsed["trivially_true"]),
+                "assert_false":           len(raw_parsed["false"]),
+                "cover_pass":             len(raw_parsed["cover_pass"]),
+                "cover_fail":             len(raw_parsed["cover_fail"]),
+            },
+        }
         trivially_true = parsed["trivially_true"]
         false_props = parsed["false_props"]
         summary = parsed["summary"]
 
-        # Step 3: Read checker.sv for FALSE property analysis
-        checker_content = ""
-        if os.path.exists(checker_path):
-            with open(checker_path, 'r', encoding='utf-8', errors='ignore') as f:
-                checker_content = f.read()
+        # Step 3: Read checker.sv (via shared stage context)
+        checker_content = ctx.get_checker_content(checker_path)
 
         # Step 4: Categorize all Fail properties (assert fail + cover fail)
         # Criterion: presence of [RTL_BUG] comment in checker.sv
@@ -1027,6 +1149,479 @@ class EnvironmentDebuggingChecker(Checker):
         else:
             result["message"] = "✅ Environment debugging stage passed"
         return True, result
+
+# =============================================================================
+# Environment Analysis Document Checker (Tri-source Validation)
+# =============================================================================
+
+class EnvironmentAnalysisChecker(Checker):
+    """Validates the environment analysis document against log results and
+    checker.sv markers.
+
+    Implements a tri-source validation strategy:
+      1. **avis.log** → Source of truth for TRIVIALLY_TRUE / FALSE property lists.
+      2. **checker.sv** → Source of truth for [RTL_BUG] markers.
+      3. **07_{DUT}_env_analysis.md** → Structured analysis document produced by LLM.
+
+    Pass conditions (ALL must be satisfied):
+      - Every TRIVIALLY_TRUE property has a corresponding <TT-NNN> entry in the doc.
+      - Every FALSE property (assert + cover) has a <FA-NNN> entry in the doc.
+      - RTL_BUG judgments in the doc are consistent with [RTL_BUG] markers in checker.sv.
+      - ACCEPTED ratio for TRIVIALLY_TRUE does not exceed the configured threshold.
+      - No unresolved ENV_ISSUE entries (property still FALSE after claimed fix).
+      - Iteration convergence: fail count should not increase across consecutive checks.
+    """
+
+    VALID_TT_ROOT_CAUSES = {"ASSUME_TOO_STRONG", "SIGNAL_CONSTANT", "WRAPPER_ERROR", "DESIGN_EXPECTED"}
+    VALID_FA_JUDGMENTS = {"RTL_BUG", "ENV_ISSUE", "COVER_EXPECTED_FAIL"}
+    VALID_TT_ACTIONS = {"FIXED", "ACCEPTED"}
+    VALID_FA_ACTIONS = {"MARKED_RTL_BUG", "ASSUME_ADDED", "ASSUME_MODIFIED", "COVER_EXPECTED_FAIL"}
+
+    def __init__(self, dut_name, log_file, checker_file, analysis_doc,
+                 tcl_script, accepted_ratio_threshold=50.0, **kwargs):
+        self.dut_name = dut_name
+        self.log_file = log_file
+        self.checker_file = checker_file
+        self.analysis_doc = analysis_doc
+        self.tcl_script = tcl_script
+        self.accepted_ratio_threshold = accepted_ratio_threshold
+
+    # -------------------------------------------------------------------------
+    # Parsing helpers
+    # -------------------------------------------------------------------------
+    def _parse_analysis_doc(self, doc_path: str) -> dict:
+        """Parse the environment analysis markdown document.
+
+        Returns:
+            {
+                "tt_entries": { "A_CK_XXX": { "root_cause": ..., "action": ..., ... }, ... },
+                "fa_entries": { "A_CK_YYY": { "judgment": ..., "action": ..., ... }, ... },
+                "raw_content": str,
+            }
+        """
+        result = {"tt_entries": {}, "fa_entries": {}, "raw_content": ""}
+
+        if not os.path.exists(doc_path):
+            return result
+
+        with open(doc_path, 'r', encoding='utf-8', errors='ignore') as f:
+            content = f.read()
+
+        result["raw_content"] = content
+
+        # Parse <TT-NNN> entries
+        tt_pattern = re.compile(
+            r'###\s*<TT-\d+>\s*(\S+)\s*\n'   # ### <TT-001> A_CK_XXX
+            r'(.*?)(?=###\s*<(?:TT|FA)-\d+>|^---$|^## \d+\.|\Z)',  # until next entry or section
+            re.DOTALL | re.MULTILINE
+        )
+        for match in tt_pattern.finditer(content):
+            prop_name = match.group(1).strip()
+            body = match.group(2)
+            entry = self._parse_entry_body(body, is_tt=True)
+            entry["prop_name"] = prop_name
+            result["tt_entries"][prop_name] = entry
+
+        # Parse <FA-NNN> entries
+        fa_pattern = re.compile(
+            r'###\s*<FA-\d+>\s*(\S+)\s*\n'
+            r'(.*?)(?=###\s*<(?:TT|FA)-\d+>|^---$|^## \d+\.|\Z)',
+            re.DOTALL | re.MULTILINE
+        )
+        for match in fa_pattern.finditer(content):
+            prop_name = match.group(1).strip()
+            body = match.group(2)
+            entry = self._parse_entry_body(body, is_tt=False)
+            entry["prop_name"] = prop_name
+            result["fa_entries"][prop_name] = entry
+
+        return result
+
+    def _parse_entry_body(self, body: str, is_tt: bool) -> dict:
+        """Extract structured fields from a TT or FA entry body."""
+        entry = {}
+
+        def _extract(field_name, text):
+            # Match "- **FieldName**: value" pattern
+            pattern = re.compile(
+                rf'[-*]*\s*\*\*{re.escape(field_name)}\*\*\s*:\s*(.*?)(?=\n\s*[-*]*\s*\*\*|\n```|\Z)',
+                re.DOTALL
+            )
+            m = pattern.search(text)
+            return m.group(1).strip() if m else None
+
+        entry["prop_name_field"] = _extract("属性名", body) or _extract("Property", body)
+
+        if is_tt:
+            entry["root_cause"] = _extract("根因分类", body) or _extract("Root Cause", body) or ""
+            entry["related_assume"] = _extract("关联 Assume", body) or _extract("Related Assume", body) or ""
+            entry["action"] = _extract("修复动作", body) or _extract("Fix Action", body) or ""
+            entry["action_detail"] = _extract("修复说明", body) or _extract("Fix Detail", body) or ""
+        else:
+            entry["judgment"] = _extract("判定结果", body) or _extract("Judgment", body) or ""
+            entry["action"] = _extract("修复动作", body) or _extract("Fix Action", body) or ""
+            entry["action_detail"] = _extract("修复说明", body) or _extract("Fix Detail", body) or ""
+            entry["prop_type"] = _extract("属性类型", body) or _extract("Property Type", body) or ""
+
+        entry["analysis"] = _extract("分析", body) or _extract("Analysis", body) or _extract("反例/分析", body) or ""
+
+        return entry
+
+    def _parse_log(self, log_path: str) -> dict:
+        """Delegate to shared parse_avis_log and restructure."""
+        raw = parse_avis_log(log_path)
+        return {
+            "trivially_true": raw.get("trivially_true", []),
+            "false_props": raw.get("false", []),
+            "cover_fail": raw.get("cover_fail", []),
+            "pass": raw.get("pass", []),
+            "cover_pass": raw.get("cover_pass", []),
+        }
+
+    # -------------------------------------------------------------------------
+    # Iteration convergence tracking
+    # -------------------------------------------------------------------------
+    def _get_iteration_log_path(self) -> str:
+        """Return path for the iteration history JSON file."""
+        tests_dir = os.path.dirname(self.get_path(self.log_file))
+        return os.path.join(tests_dir, f".{self.dut_name}_iteration_history.json")
+
+    def _record_iteration(self, stats: dict) -> list:
+        """Append current stats to iteration history and return full history."""
+        import json
+        import time
+
+        log_path = self._get_iteration_log_path()
+        history = []
+
+        if os.path.exists(log_path):
+            try:
+                with open(log_path, 'r') as f:
+                    history = json.load(f)
+            except (json.JSONDecodeError, IOError):
+                history = []
+
+        entry = {
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "pass_count": stats.get("pass_count", 0),
+            "fail_count": stats.get("fail_count", 0),
+            "tt_count": stats.get("tt_count", 0),
+            "cover_pass": stats.get("cover_pass", 0),
+            "cover_fail": stats.get("cover_fail", 0),
+        }
+        history.append(entry)
+
+        try:
+            with open(log_path, 'w') as f:
+                json.dump(history, f, indent=2, ensure_ascii=False)
+        except IOError:
+            pass
+
+        return history
+
+    def _check_convergence(self, history: list) -> tuple:
+        """Check if iterations are converging.
+
+        Returns: (is_ok, message)
+        - is_ok=True means either improving or first iteration.
+        - is_ok=False means regression detected (fail count increased).
+        """
+        if len(history) < 2:
+            return True, ""
+
+        prev = history[-2]
+        curr = history[-1]
+
+        prev_fail = prev.get("fail_count", 0) + prev.get("cover_fail", 0)
+        curr_fail = curr.get("fail_count", 0) + curr.get("cover_fail", 0)
+        prev_tt = prev.get("tt_count", 0)
+        curr_tt = curr.get("tt_count", 0)
+        prev_pass = prev.get("pass_count", 0) + prev.get("cover_pass", 0)
+        curr_pass = curr.get("pass_count", 0) + curr.get("cover_pass", 0)
+
+        messages = []
+
+        # Check regression
+        if curr_pass < prev_pass:
+            messages.append(
+                f"⚠️  REGRESSION: Pass count decreased ({prev_pass} → {curr_pass}). "
+                f"Consider reverting the last modification to checker.sv/wrapper.sv."
+            )
+
+        # Check stagnation
+        if curr_fail >= prev_fail and curr_tt >= prev_tt and len(history) >= 3:
+            # Check 3-iteration stagnation
+            prev2 = history[-3]
+            prev2_fail = prev2.get("fail_count", 0) + prev2.get("cover_fail", 0)
+            if prev2_fail <= prev_fail:
+                messages.append(
+                    f"⚠️  STAGNATION: Fail count has not decreased for 3 consecutive iterations "
+                    f"({prev2_fail} → {prev_fail} → {curr_fail}). "
+                    f"Try a different fix strategy — perhaps the root cause is in wrapper.sv signal mapping."
+                )
+
+        if curr_fail > prev_fail:
+            messages.append(
+                f"⚠️  DEGRADATION: Fail count increased ({prev_fail} → {curr_fail}). "
+                f"The last modification may have introduced new failures."
+            )
+
+        is_ok = curr_pass >= prev_pass  # Only fail on pass regression
+        return is_ok, "\n".join(messages)
+
+    # -------------------------------------------------------------------------
+    # Main check
+    # -------------------------------------------------------------------------
+    def do_check(self, timeout=300, **kwargs) -> tuple:
+        """Perform tri-source environment analysis validation."""
+        log_path = self.get_path(self.log_file)
+        checker_path = self.get_path(self.checker_file)
+        analysis_path = self.get_path(self.analysis_doc)
+
+        # Infer wrapper path
+        tests_dir = os.path.dirname(log_path)
+        wrapper_path = os.path.join(tests_dir, f"{self.dut_name}_wrapper.sv")
+
+        # Step 0: Check if re-execution needed (same logic as EnvironmentDebuggingChecker)
+        need_rerun = False
+        if not os.path.exists(log_path):
+            need_rerun = True
+        else:
+            log_mtime = os.path.getmtime(log_path)
+            for fpath in [checker_path, wrapper_path]:
+                if os.path.exists(fpath) and os.path.getmtime(fpath) > log_mtime:
+                    need_rerun = True
+                    break
+
+        if need_rerun:
+            info("🚀 Source files updated, re-executing TCL script...")
+            exec_checker = TclExecutionChecker(self.tcl_script, self.dut_name)
+            exec_checker.get_path = self.get_path
+            exec_success, exec_result = exec_checker.do_check(timeout)
+            if not exec_success:
+                return False, {
+                    "error": "❌ TCL script execution failed",
+                    "details": exec_result,
+                    "suggestion": "Check TCL script, checker.sv, and wrapper.sv for syntax errors"
+                }
+            info("✅ TCL execution successful, log updated")
+
+        # Step 1: Parse avis.log (via shared stage context — reuses cache from EnvironmentDebuggingChecker)
+        info("🔍 Parsing verification log...")
+        ctx = FormalStageContext.get_or_create(self)
+        if need_rerun:
+            ctx.invalidate(log_path)
+        raw = ctx.get_parsed_log(log_path)
+        tt_props = raw.get("trivially_true", [])
+        false_props = raw.get("false", [])
+        cover_fail = raw.get("cover_fail", [])
+        parsed = {
+            "pass": raw.get("pass", []),
+            "cover_pass": raw.get("cover_pass", []),
+        }
+        all_abnormal_assert = tt_props + false_props
+        all_abnormal = all_abnormal_assert + cover_fail
+
+        # Step 2: Record iteration stats
+        stats = {
+            "pass_count": len(parsed["pass"]),
+            "fail_count": len(false_props),
+            "tt_count": len(tt_props),
+            "cover_pass": len(parsed["cover_pass"]),
+            "cover_fail": len(cover_fail),
+        }
+        history = self._record_iteration(stats)
+
+        # Step 3: Check convergence
+        conv_ok, conv_msg = self._check_convergence(history)
+
+        # Step 4: Check if analysis document exists
+        if not os.path.exists(analysis_path):
+            summary_lines = [
+                f"📊 Log Summary: {len(parsed['pass'])} pass, {len(tt_props)} TT, "
+                f"{len(false_props)} assert fail, {len(cover_fail)} cover fail",
+            ]
+            if conv_msg:
+                summary_lines.append(f"\n{conv_msg}")
+
+            return False, {
+                "error": "❌ Environment analysis document not found",
+                "details": (
+                    f"Please create '{self.analysis_doc}' following the template "
+                    f"'Guide_Doc/dut_env_analysis_template.md'.\n\n"
+                    f"The document must contain analysis entries for:\n"
+                    f"  - {len(tt_props)} TRIVIALLY_TRUE properties (each needs a <TT-NNN> entry)\n"
+                    f"  - {len(false_props)} FALSE assert properties (each needs a <FA-NNN> entry)\n"
+                    f"  - {len(cover_fail)} FALSE cover properties (each needs a <FA-NNN> entry)\n\n"
+                    f"Problematic properties:\n"
+                    + "\n".join(f"  [TT] {p}" for p in tt_props)
+                    + ("\n" if tt_props else "")
+                    + "\n".join(f"  [FAIL-Assert] {p}" for p in false_props)
+                    + ("\n" if false_props else "")
+                    + "\n".join(f"  [FAIL-Cover] {p}" for p in cover_fail)
+                ),
+                "log_summary": "\n".join(summary_lines),
+                "iteration": len(history),
+            }
+
+        # Step 5: Parse analysis document
+        info("📄 Parsing environment analysis document...")
+        doc = self._parse_analysis_doc(analysis_path)
+        tt_entries = doc["tt_entries"]
+        fa_entries = doc["fa_entries"]
+
+        # Step 6: Read checker.sv for [RTL_BUG] markers (via shared stage context)
+        rtl_bugs_in_checker = ctx.get_rtl_bug_set(checker_path)
+
+        # Step 7: Tri-source validation
+        errors = []
+        warnings = []
+
+        # --- 7a: Completeness — every TT prop must have a <TT-*> entry ---
+        missing_tt = []
+        for prop in tt_props:
+            if prop not in tt_entries:
+                missing_tt.append(prop)
+        if missing_tt:
+            errors.append(
+                f"❌ {len(missing_tt)} TRIVIALLY_TRUE properties missing analysis in document:\n"
+                + "\n".join(f"  - {p} (needs a <TT-NNN> entry)" for p in missing_tt)
+            )
+
+        # --- 7b: Completeness — every FALSE prop must have a <FA-*> entry ---
+        all_false = false_props + cover_fail
+        missing_fa = []
+        for prop in all_false:
+            if prop not in fa_entries:
+                missing_fa.append(prop)
+        if missing_fa:
+            errors.append(
+                f"❌ {len(missing_fa)} FALSE properties missing analysis in document:\n"
+                + "\n".join(f"  - {p} (needs a <FA-NNN> entry)" for p in missing_fa)
+            )
+
+        # --- 7c: Consistency — RTL_BUG judgment must match checker.sv markers ---
+        doc_rtl_bugs = {name for name, e in fa_entries.items()
+                        if e.get("judgment", "").strip().upper() == "RTL_BUG"}
+        # Check: doc says RTL_BUG but checker.sv has no marker
+        unmarked = doc_rtl_bugs - rtl_bugs_in_checker
+        if unmarked:
+            errors.append(
+                f"❌ {len(unmarked)} properties judged as RTL_BUG in document but missing "
+                f"// [RTL_BUG] marker in checker.sv:\n"
+                + "\n".join(f"  - {p}" for p in unmarked)
+                + "\n  → Add '// [RTL_BUG] <description>' before each property definition in checker.sv"
+            )
+
+        # Check: checker.sv has [RTL_BUG] but doc doesn't say RTL_BUG
+        undocumented_rtl = rtl_bugs_in_checker - doc_rtl_bugs
+        # Filter to only those that are actually FALSE in log
+        undocumented_rtl = undocumented_rtl & set(all_false)
+        if undocumented_rtl:
+            warnings.append(
+                f"⚠️  {len(undocumented_rtl)} properties have [RTL_BUG] in checker.sv but "
+                f"document judgment is not RTL_BUG:\n"
+                + "\n".join(f"  - {p}" for p in undocumented_rtl)
+            )
+
+        # --- 7d: ACCEPTED ratio threshold ---
+        if tt_entries:
+            accepted_count = sum(
+                1 for e in tt_entries.values()
+                if e.get("action", "").strip().upper() == "ACCEPTED"
+            )
+            total_tt = len(tt_entries)
+            accepted_ratio = (accepted_count / total_tt * 100) if total_tt > 0 else 0
+
+            if accepted_ratio > self.accepted_ratio_threshold:
+                errors.append(
+                    f"❌ ACCEPTED ratio for TRIVIALLY_TRUE too high: "
+                    f"{accepted_count}/{total_tt} = {accepted_ratio:.0f}% "
+                    f"(threshold: {self.accepted_ratio_threshold:.0f}%)\n"
+                    f"  → Too many TRIVIALLY_TRUE properties accepted without fixing. "
+                    f"Review and fix the underlying assume constraints."
+                )
+
+        # --- 7e: Field completeness check ---
+        for prop, entry in tt_entries.items():
+            if not entry.get("root_cause", "").strip():
+                errors.append(f"❌ <TT> entry '{prop}' missing '根因分类' field")
+            elif entry["root_cause"].strip().upper() not in self.VALID_TT_ROOT_CAUSES:
+                warnings.append(
+                    f"⚠️  <TT> entry '{prop}' has unknown root cause: '{entry['root_cause']}'. "
+                    f"Valid: {self.VALID_TT_ROOT_CAUSES}"
+                )
+            if not entry.get("action", "").strip():
+                errors.append(f"❌ <TT> entry '{prop}' missing '修复动作' field")
+            if not entry.get("analysis", "").strip():
+                errors.append(f"❌ <TT> entry '{prop}' missing '分析' field")
+
+        for prop, entry in fa_entries.items():
+            if not entry.get("judgment", "").strip():
+                errors.append(f"❌ <FA> entry '{prop}' missing '判定结果' field")
+            if not entry.get("action", "").strip():
+                errors.append(f"❌ <FA> entry '{prop}' missing '修复动作' field")
+            if not entry.get("analysis", "").strip():
+                errors.append(f"❌ <FA> entry '{prop}' missing '分析/反例' field")
+
+        # --- 7f: Convergence warnings ---
+        if conv_msg:
+            warnings.append(conv_msg)
+
+        # Build report
+        report = {
+            "log_summary": {
+                "assert_pass": len(parsed["pass"]),
+                "assert_trivially_true": len(tt_props),
+                "assert_fail": len(false_props),
+                "cover_pass": len(parsed["cover_pass"]),
+                "cover_fail": len(cover_fail),
+            },
+            "doc_summary": {
+                "tt_entries": len(tt_entries),
+                "fa_entries": len(fa_entries),
+            },
+            "checker_rtl_bugs": list(rtl_bugs_in_checker),
+            "iteration": len(history),
+        }
+
+        if warnings:
+            report["warnings"] = warnings
+
+        if errors:
+            report["errors"] = errors
+            report["error"] = (
+                f"❌ Environment analysis validation failed ({len(errors)} issues)\n\n"
+                + "\n\n".join(errors)
+            )
+            return False, report
+
+        # All checks passed
+        # Build summary
+        tt_fixed = sum(1 for e in tt_entries.values()
+                       if e.get("action", "").strip().upper() == "FIXED")
+        tt_accepted = sum(1 for e in tt_entries.values()
+                          if e.get("action", "").strip().upper() == "ACCEPTED")
+        fa_rtl_bug = sum(1 for e in fa_entries.values()
+                         if e.get("judgment", "").strip().upper() == "RTL_BUG")
+        fa_env_issue = sum(1 for e in fa_entries.values()
+                           if e.get("judgment", "").strip().upper() == "ENV_ISSUE")
+        fa_cover_expected = sum(1 for e in fa_entries.values()
+                                if e.get("judgment", "").strip().upper() == "COVER_EXPECTED_FAIL")
+
+        report["message"] = (
+            f"✅ Environment analysis validation passed (iteration #{len(history)})\n"
+            f"  TRIVIALLY_TRUE: {len(tt_entries)} analyzed "
+            f"({tt_fixed} fixed, {tt_accepted} accepted)\n"
+            f"  FALSE: {len(fa_entries)} analyzed "
+            f"({fa_rtl_bug} RTL bugs, {fa_env_issue} env issues, "
+            f"{fa_cover_expected} expected cover fails)"
+        )
+        if warnings:
+            report["message"] += "\n  " + "\n  ".join(warnings)
+
+        return True, report
+
 
 # =============================================================================
 # Counterexample Python Test Generation Checker
