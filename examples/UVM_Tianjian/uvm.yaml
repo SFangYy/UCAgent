@@ -1,0 +1,490 @@
+
+ex_tools:
+  - "examples.UVM_Tianjian.scripts.uvm_tools.GenerateTianjianIni"
+  - "examples.UVM_Tianjian.scripts.uvm_tools.RunTianjianGen"
+  - "examples.UVM_Tianjian.scripts.uvm_tools.RunUVMCompile"
+  - "examples.UVM_Tianjian.scripts.uvm_tools.RunUVMSim"
+  - "examples.UVM_Tianjian.scripts.uvm_tools.RunUVMRegression"
+  - "examples.UVM_Tianjian.scripts.uvm_tools.ExtractCoverageMetrics"
+
+# ---------- Template Variables ----------
+template_overwrite:
+  DOC_GEN_LANG: "中文"
+  RTL_PATH: "{DUT}"
+  FILE_PATH: "output/{DUT}"
+  OUT_PATH: "output/{OUT}"
+
+# ---------- Read-only Protected Directories ----------
+un_write_dirs:
+  - "{DUT}/"
+  - "Guide_Doc/"
+
+# ---------- No predefined template ----------
+template: ""
+
+# ---------- TUI Interface Configuration ----------
+tui:
+  task_width: 50
+  console_height: 19
+  status_height: 10
+
+# ---------- Hook Configuration ----------
+hooks:
+  continue: >
+    你还没有完成所有任务，请继续。请通过Check和Complete工具来判断你是否完成了当前阶段的任务。
+    请认真分析Check和Complete工具的返回结果，并根据反馈调整你的工作，直到所有Check和Complete都通过为止。
+    如果出现 UVM_FATAL，请优先排查环境配置是否正确。
+    如果出现 UVM_ERROR，请先判断是 Scoreboard 比对不一致还是协议违规，再决定修复方向。
+    优先使用Complete工具（阶段推进总耗时时间更短），必要时使用Check工具进行阶段检查。
+  cagent_init: >
+    请通过工具RoleInfo获取你的角色信息和基本指导，然后完成任务。请使用工具ReadTextFile读取文件。
+
+# ============================================================================
+# Mission Definition
+# ============================================================================
+mission:
+  name: "{DUT} UVM 自动化验证任务 (Tianjian)"
+  prompt:
+    system: |
+      你是一名顶尖的芯片验证架构师。你的目标是通过 UVM (Universal Verification Methodology) 和基于天箭(Tianjian)的自动化脚本生成，完成对 {DUT} 的全面、高质量功能验证。
+      你具备深厚的硬件设计理解能力，精通 SystemVerilog, UVM, 以及对应的 EDA 仿真工具。
+      你非常优秀，能发现验证中的所有 bug 和潜在隐患，能基于源代码进行 bug 详细分析并给出修复建议。
+      你不惧怕测试用例 Fail，因为 Fail 可能意味着 bug，这是发现 {DUT} 中 bug 的基础。
+
+      **工作环境：**
+      - UCAgent: {Version} (https://github.com/XS-MLVP/UCAgent)
+      - UVM 生成引擎: Tianjian (天箭)
+      - 语言: SystemVerilog / UVM
+      - 指导文档: Guide_Doc/ 目录下
+
+      **验证专业原则：**
+      1. **谋定而后动**：只有在功能规格、Agent 提取、Bug 静态分析充分完成后，才能生成环境。这决定了架构的正确性。
+      2. **覆盖率驱动**：以功能点拆解出的 `<FG-*>`, `<FC-*>`, `<CK-*>` 为基石，建立 Covergroup 和 Coverpoint。
+      3. **全流程自动化**：使用特定的天箭脚本和自动化构建工具生成框架、编译执行和分析覆盖率。
+      4. **隔离与重用**：严格遵守 UVM 机制，确保 Agent 的独立性（Monitor, Driver, Sequencer），和组件的重用性。
+      5. **拒绝无效验证**：任何 UVM_FATAL 都意味着环境有缺陷，必须在继续测试前修复。
+      6. **白盒与黑盒结合**：以 DUT 的输入输出端口行为为核心验证目标，必要时通过 Scoreboard 参考模型进行白盒辅助。
+
+      **UVM 环境架构原则：**
+      - Agent 应按接口协议分组（而非功能块），每个 Agent 封装完整的 Driver + Monitor + Sequencer 三件套
+      - Scoreboard 实现参考模型逻辑，接收 exp（预期）和 act（实际）两路数据进行比对
+      - Functional Coverage (fcov) 严格按 FG→covergroup, FC→coverpoint, CK→bins 映射
+      - 天箭生成的是骨架代码，必须在 Stage 6 中填充实际业务逻辑
+
+      **必须使用的工具：**
+      - `CurrentTips`, `Complete`, `Check`, `ReadTextFile`, `Detail`, `Status`, `SetCurrentStageJournal`
+      - `GenerateTianjianIni`：提取信息并生成 Tianjian 环境配置文件 `env_cfg.ini`
+      - `RunTianjianGen`：执行天箭生成脚本
+      - `RunUVMCompile`：编译生成好的包含 DUT 的验证环境
+      - `RunUVMSim`：运行单 Seed UVM 仿真
+      - `RunUVMRegression`：运行多 Seed 回归
+      - `ExtractCoverageMetrics`：抽取代码覆盖率
+
+      **工作流组织结构：**
+      - 调用工具`Detail`获取 Mission 详情和当前进度
+      - 调用工具`Status`获取 Mission 摘要和阶段状态
+      - 工作流组织 (Mission Structure):
+        - 工作流由多个 stage 组成，每个 stage 包含具体的 task 描述，需要按顺序完成
+        - 子 stage 处理机制:
+          - 如果 stage 中包含子 stage，必须按顺序逐一完成每个子 stage
+          - 所有子 stage 完成后，再检测父 stage（upper_stage）是否达到完成标准
+          - 父 stage 完成后，则进入下一个主要阶段
+          - 使用`Status`工具可以查看当前处于哪个具体的子 stage
+        - 阶段推进原则:
+          - 当前阶段未完成时，不能跳转到下一阶段
+          - 使用`CurrentTips`获取当前阶段/子阶段的具体任务指导
+          - 确认完成后用`Complete`工具正式推进到下一阶段
+
+      **工作原则：**
+      - 按步骤有序进行，每步完成后用`Complete`工具进入下一个阶段
+      - 请注意Complete和Check工具进行阶段检查时的区别：
+      -   Check工具仅仅进行阶段检查，不会推进阶段
+      -   Complete工具进行阶段检查后，如果通过检查后，推进到下一个阶段
+      -   建议优先使用Complete工具（阶段推进总耗时时间更短），必要时使用Check工具进行阶段检查
+      - 需要根据Complete（或者Check）的结果调整你的工作，目标是保证所有Complete都通过
+      - 完成一个Stage后，再进入下一个Stage，直到所有Stage都完成，才算整个验证任务完成
+      - 除非Complete工具（或者Check工具）要求等待人工确认，否则不需要人工介入，不需要询问任何问题
+      - 在计划通过Complete工具推进到下一个阶段前，需要通过工具SetCurrentStageJournal进行阶段日志记录
+      - 如果不是从第一阶段开始工作，你需要：
+      -   通过CurrentTips工具获取当前阶段的具体任务指导
+      -   通过Status工具获取当前阶段状态，确认你处于哪个阶段
+      -   通过AllStageJournal工具获取之前阶段的日志，了解之前阶段的工作内容和结果
+
+      **指导文档路径：**
+      - Guide_Doc/dut_functions_and_checks.md — 功能点与检测点规范
+      - Guide_Doc/dut_bug_analysis.md         — 静态 Bug 分析模板
+      - Guide_Doc/dut_uvm_env_guide.md        — UVM 环境定制指南
+      - Guide_Doc/dut_agent_plan_template.md   — Agent 规划模板
+      - Guide_Doc/dut_test_summary.md          — 测试总结模板
+
+              现在调用`CurrentTips`，开启你的验证工作！
+    tips:
+      allways:
+        - "请优先使用Complete工具进行阶段推进检查。"
+        - "你需要完成所有阶段的任务，才算完成整个验证任务。"
+        - "不清楚目标时，需要通过工具RoleInfo获取角色信息和基本指导。"
+      random:
+        - "在开始编写 UVM 代码前请使用 RunUVMCompile 确认环境是否有语法错误。"
+        - "如果有 UVM_FATAL，必须第一时间停止流程并去修复它。"
+        - "每个 CK 检测点都必须有对应的 Sequence 或 Test 实现，不允许遗漏。"
+        - "使用 RunUVMSim 工具可即时验证修改效果，推荐 `RunUVMSim(work_dir=\"...\", test_name=\"test_sanity\")`。"
+        - "判断是否完成阶段任务时，优先使用Complete工具，其次是Check工具。"
+        - "天箭生成的是骨架代码，Stage 6 中必须填充 xaction 约束、scoreboard 参考模型、fcov 打点等实际逻辑。"
+        - "Coverage 模型必须严格按 FG→covergroup, FC→coverpoint, CK→bins 映射。"
+        - "Scoreboard 比对失败时，优先检查参考模型逻辑是否正确，再判定是否为 RTL Bug。"
+
+# ---------- MCP Server Configuration ----------
+mcp_server:
+  init_prompt: >
+    请通过工具`RoleInfo`获取你的角色信息和基本指导，然后完成任务。请使用工具`ReadTextFile`读取文件。
+
+# ============================================================================
+# Stage Definition — 9-stage progressive UVM verification
+# ============================================================================
+stage:
+  # ========== Stage 1: 需求分析与验证规划 ==========
+  - name: requirement_analysis_and_planning
+    desc: "需求分析与验证规划"
+    task:
+      - "第1步：研读{DUT}的设计规格。分析包含的文档或 README.md。"
+      - "第2步：分析{DUT}的 RTL 源码，了解模块层次。"
+      - "第3步：根据模块特性规划 UVM 的层次（Block/Subsystem/System Level）。"
+      - "第4步：在 {OUT}/01_{DUT}_verification_needs_and_plan.md 输出总体规划。"
+    reference_files: [ "{DUT}/README.md", "{RTL_PATH}/*.v", "{RTL_PATH}/*.sv" ]
+    output_files: [ "{OUT}/01_{DUT}_verification_needs_and_plan.md" ]
+    checker:
+      - name: markdown_file_check
+        clss: "UnityChipCheckerMarkdownFileFormat"
+        args: { markdown_file_list: "{OUT}/01_{DUT}_verification_needs_and_plan.md", no_line_break: true }
+
+  # ========== Stage 2: DUT 功能理解 ==========
+  - name: dut_function_understanding
+    desc: "{DUT}功能理解"
+    task:
+      - "第1步：通读 RTL，理解各接口的时序与协议。"
+      - "第2步：识别数据通路、控制逻辑、存储模块、时钟与复位设计。"
+      - "第3步：整理成 {OUT}/02_{DUT}_basic_info.md。"
+    reference_files: [ "{DUT}/README.md", "{RTL_PATH}/*.v", "{RTL_PATH}/*.sv" ]
+    output_files: [ "{OUT}/02_{DUT}_basic_info.md" ]
+    checker:
+      - name: markdown_file_check
+        clss: "UnityChipCheckerMarkdownFileFormat"
+        args: { markdown_file_list: "{OUT}/02_{DUT}_basic_info.md", no_line_break: true }
+
+  # ========== Stage 3: 功能规格分析与验证策略定义（含子 Stage） ==========
+  - name: functional_specification_analysis
+    desc: "功能规格分析与验证策略定义"
+    task:
+      - "目标：将{DUT}的功能拆解为三级标签体系（FG → FC → CK），作为后续覆盖率模型和 Scoreboard 判断逻辑的核心契约。"
+      - "第1步：依据阶段 2 产出，使用 <FG-*>, <FC-*>, <CK-*> 层级结构描述系统工作原理。"
+      - "第2步：为每个校验点定义测试策略。"
+      - "第3步：写到 {OUT}/03_{DUT}_functions_and_checks.md"
+      - "重要提示：请严格参考 Guide_Doc/dut_functions_and_checks.md 了解标签规范。"
+    reference_files:
+      - "Guide_Doc/dut_functions_and_checks.md"
+      - "{DUT}/*.md"
+      - "{OUT}/02_{DUT}_basic_info.md"
+      - "{OUT}/01_{DUT}_verification_needs_and_plan.md"
+    output_files:
+      - "{OUT}/03_{DUT}_functions_and_checks.md"
+    stage:
+      - name: dut_function_grouping
+        desc: "DUT功能分组与层次划分{COUNT_FG}"
+        task:
+          - "将全部待验证功能按逻辑相关性划分为功能组，以 <FG-名称> 标记。"
+          - "**强制要求**：必须包含 <FG-API> 组用于描述接口级行为。"
+          - "示例：<FG-DATAPATH>，<FG-FLOW-CTRL>，<FG-RESET>，<FG-API>"
+        checker:
+          - name: group_structure_check
+            clss: "UnityChipCheckerLabelStructure"
+            args:
+              doc_file: "{OUT}/03_{DUT}_functions_and_checks.md"
+              leaf_node: "FG"
+      - name: function_point_definition
+        desc: "具体功能点识别与定义{COUNT_FC}"
+        task:
+          - "在每个 FG 内，细化具体功能点，以 <FC-名称> 标记。"
+          - "功能点需要"可测试"，能通过输入输出端口进行验证。"
+          - "示例：<FC-VALID-DATA-PASS>，<FC-BACKPRESSURE-HOLD>"
+        checker:
+          - name: function_point_check
+            clss: "UnityChipCheckerLabelStructure"
+            args:
+              doc_file: "{OUT}/03_{DUT}_functions_and_checks.md"
+              leaf_node: "FC"
+      - name: check_point_design
+        desc: "检测点设计与定义{COUNT_CK}"
+        task:
+          - "为每个 FC 设计 <CK-名称> 检测点，覆盖正常场景、边界条件和异常场景。"
+          - "检测点要能明确对应验证的方向（正向/负向/边界）。"
+          - "示例：<CK-VALID-HOLD-AFTER-GRANT>，<CK-RESET-CLEAR-ALL-SIGNALS>"
+          - "在 UVM 场景下，每个 CK 将映射为 covergroup 中的 bins 或专项 Sequence。"
+        checker:
+          - name: check_point_check
+            clss: "UnityChipCheckerLabelStructure"
+            args:
+              doc_file: "{OUT}/03_{DUT}_functions_and_checks.md"
+              leaf_node: "FC"
+              data_key: "COVER_GROUP_DOC_CK_LIST"
+        need_human_check: $(HUMAN_CHECK_CK: false)
+
+  # ========== Stage 4: RTL 源码静态 Bug 分析 ==========
+  - name: static_bug_analysis
+    desc: "RTL源码静态Bug分析[{ANALYSIS_PROGRESS}]"
+    task:
+      - "排查并记录源代码层面的常见设计缺陷，使用 <BG-STATIC-NNN-NAME> 记录到 {OUT}/04_{DUT}_static_bug_analysis.md"
+      - "参考 Guide_Doc/dut_bug_analysis.md 了解标签格式规范。"
+    reference_files:
+      - "Guide_Doc/dut_bug_analysis.md"
+      - "{OUT}/03_{DUT}_functions_and_checks.md"
+      - "{OUT}/02_{DUT}_basic_info.md"
+    output_files:
+      - "{OUT}/04_{DUT}_static_bug_analysis.md"
+    checker:
+      - name: static_bug_batch_analysis_check
+        clss: "UnityChipBatchCheckerStaticBug"
+        args:
+          static_doc: "{OUT}/04_{DUT}_static_bug_analysis.md"
+          functions_and_checks_doc: "{OUT}/03_{DUT}_functions_and_checks.md"
+          file_list: [ "{RTL_PATH}/**/*.v", "{RTL_PATH}/**/*.sv" ]
+          batch_size: 1
+
+  # ========== Stage 5: 接口提取与天箭 UVM 环境生成（含子 Stage） ==========
+  - name: interface_extraction_and_env_bootstrapping
+    desc: "天箭 UVM 环境生成"
+    task:
+      - "目标：基于前序阶段对 DUT 功能和接口的深入理解，将 RTL 信号映射为天箭 env_cfg.ini 配置，调用天箭脚本自动生成完整 UVM 验证平台骨架。"
+      - "参考 Guide_Doc/dut_agent_plan_template.md 了解 Agent 规划的 JSON 结构。"
+      - "参考 Guide_Doc/dut_uvm_env_guide.md 了解 UVM 环境定制原则。"
+    reference_files:
+      - "{OUT}/02_{DUT}_basic_info.md"
+      - "{OUT}/03_{DUT}_functions_and_checks.md"
+      - "Guide_Doc/dut_agent_plan_template.md"
+      - "Guide_Doc/dut_uvm_env_guide.md"
+    output_files:
+      - "{OUT}/05_{DUT}_agent_plan.md"
+      - "{OUT_PATH}/env_cfg.ini"
+    stage:
+      - name: agent_planning
+        desc: "Agent 规划与接口映射"
+        task:
+          - "第1步：读取 02_{DUT}_basic_info.md 中的端口列表，按协议语义对信号分组。"
+          - "第2步：为每组接口确定 Agent 模式（master / only_monitor）。"
+          - "第3步：识别可复用 Agent（多通道信号列表一致时，通过 instance_by 复用）。"
+          - "第4步：确定 Scoreboard 连接策略：每个 Agent 的数据应连接 exp（预期侧）还是 act（实际侧）。"
+          - "第5步：将规划结果写入 {OUT}/05_{DUT}_agent_plan.md。"
+        checker:
+          - name: agent_plan_check
+            clss: "UnityChipCheckerMarkdownFileFormat"
+            args:
+              markdown_file_list: "{OUT}/05_{DUT}_agent_plan.md"
+              no_line_break: true
+      - name: tianjian_config_generation
+        desc: "天箭配置文件生成"
+        task:
+          - "第1步：基于 Agent 规划文档，使用 `GenerateTianjianIni` 工具生成 env_cfg.ini。"
+          - "第2步：信号方向和位宽必须与 RTL 源码严格一致。"
+        checker:
+          - name: tianjian_ini_syntax_check
+            clss: "examples.UVM_Tianjian.scripts.uvm_checkers.TianjianIniSyntaxChecker"
+            args: { ini_file: "{OUT_PATH}/env_cfg.ini" }
+      - name: tianjian_execution
+        desc: "天箭脚本执行与编译检查"
+        task:
+          - "第1步：使用 `RunTianjianGen` 工具执行天箭生成脚本，自动构建完整 UVM 目录树。"
+          - "第2步：检查生成的目录结构完整性（Agent 目录、env_common、Makefile 等）。"
+          - "第3步：（可选）使用 `RunUVMCompile` 工具测试 make compile 是否能通过基线编译。"
+        checker:
+          - name: tianjian_output_check
+            clss: "examples.UVM_Tianjian.scripts.uvm_checkers.TianjianOutputChecker"
+            args: { ini_file: "{OUT_PATH}/env_cfg.ini", gen_output_dir: "{OUT_PATH}" }
+
+  # ========== Stage 6: UVM 环境逻辑定制（含子 Stage） ==========
+  - name: uvm_env_customization
+    desc: "UVM 环境逻辑定制"
+    task:
+      - "目标：天箭生成了完整的 UVM 组件骨架（Agent/Env/Scoreboard/fcov），但内部均为空模板。本阶段需结合 Stage 3 的功能点与检测点，为这些骨架填充实际业务逻辑。"
+      - "参考 Guide_Doc/dut_uvm_env_guide.md 了解各组件定制规范。"
+    reference_files:
+      - "{OUT}/03_{DUT}_functions_and_checks.md"
+      - "{OUT}/02_{DUT}_basic_info.md"
+      - "Guide_Doc/dut_uvm_env_guide.md"
+    output_files: []
+    stage:
+      - name: transaction_constraint_design
+        desc: "Transaction 约束定义"
+        task:
+          - "第1步：打开天箭生成的 {agent_name}_agent_xaction.sv 文件。"
+          - "第2步：基于协议规格和功能需求，为 rand 字段添加有意义的 constraint。"
+          - "第3步：完善 compare() 函数中的逐字段比较逻辑。"
+          - "第4步：完善 psdisplay() 函数中的调试打印信息。"
+        checker:
+          - name: uvm_xaction_syntax_check
+            clss: "examples.UVM_Tianjian.scripts.uvm_checkers.UvmSyntaxChecker"
+            args: { target_file: "{OUT_PATH}" }
+      - name: scoreboard_ref_model
+        desc: "Scoreboard 参考模型填充"
+        task:
+          - "第1步：打开天箭生成的环境级 Scoreboard 文件。"
+          - "第2步：结合 03_{DUT}_functions_and_checks.md 中的 <CK-*> 检测点，实现比对逻辑。"
+          - "第3步：在 exp 侧添加预期数据计算逻辑（参考模型 / Golden Model）。"
+          - "第4步：在 compare() 中逐字段比较 exp 与 act 通道数据。"
+          - "第5步：为每个比对失败场景添加详细的 uvm_error 报告信息。"
+        checker:
+          - name: uvm_scb_syntax_check
+            clss: "examples.UVM_Tianjian.scripts.uvm_checkers.UvmSyntaxChecker"
+            args: { target_file: "{OUT_PATH}" }
+      - name: fcov_implementation
+        desc: "功能覆盖率埋点"
+        task:
+          - "第1步：打开天箭生成的 {env_name}_fcov.sv 文件。"
+          - "第2步：基于 03_{DUT}_functions_and_checks.md 中的标签层级，创建对应 Covergroup。"
+          - "  - 每个 <FG-*> 对应一个 covergroup"
+          - "  - 每个 <FC-*> 对应一组 coverpoint"
+          - "  - 每个 <CK-*> 对应一个或多个 bins 定义"
+          - "第3步：在 Monitor 或 Scoreboard 的适当位置调用 sample() 触发采集。"
+        checker:
+          - name: uvm_fcov_structure_check
+            clss: "examples.UVM_Tianjian.scripts.uvm_checkers.UvmFcovStructureChecker"
+            args: { fcov_file: "{OUT_PATH}/{DUT}_fcov.sv", spec_file: "{OUT}/03_{DUT}_functions_and_checks.md" }
+      - name: driver_monitor_timing
+        desc: "Driver / Monitor 时序完善"
+        task:
+          - "第1步：检查天箭生成的 Driver 模板，补全特定协议的驱动时序逻辑。"
+          - "第2步：检查 Monitor 中信号采样的正确性（使用 mon_cb clocking block）。"
+          - "第3步：确保 DUT 顶层 Interface 绑定正确、所有信号连线无误。"
+          - "第4步：使用 RunUVMCompile 确认完整环境编译通过。"
+        checker:
+          - name: uvm_drv_syntax_check
+            clss: "examples.UVM_Tianjian.scripts.uvm_checkers.UvmSyntaxChecker"
+            args: { target_file: "{OUT_PATH}" }
+
+  # ========== Stage 7: 测试序列与用例开发（含子 Stage） ==========
+  - name: uvm_sequence_and_test_development
+    desc: "UVM 测试用例与序列开发"
+    task:
+      - "目标：基于功能检测点文档，编写从冒烟测试到定向/随机测试的完整 Sequence 和 Test 用例库，并通过首轮仿真验证环境联通性。"
+    reference_files:
+      - "{OUT}/03_{DUT}_functions_and_checks.md"
+      - "{OUT}/04_{DUT}_static_bug_analysis.md"
+    output_files:
+      - "{OUT}/06_{DUT}_bug_analysis.md"
+    stage:
+      - name: sanity_test
+        desc: "冒烟测试开发"
+        task:
+          - "第1步：编写 test_sanity 用例，仅验证复位后所有输出信号归零/归默认值，以及单笔最简数据从输入到输出的端到端联通。"
+          - "第2步：编写对应的 sanity_sequence，发送 1~2 笔最简事务。"
+          - "第3步：运行 RunUVMSim(test_name=\"test_sanity\")，确保 UVM Report Phase 输出 UVM_TEST_PASSED。"
+          - "第4步：若出现 UVM_FATAL / UVM_ERROR，分析并修复环境问题（不修复 DUT）。"
+        checker:
+          - name: uvm_sanity_sim_check
+            clss: "examples.UVM_Tianjian.scripts.uvm_checkers.UvmSimLogChecker"
+            args: { log_file: "{OUT_PATH}/sim_sanity.log", max_errors: 0 }
+      - name: directed_tests
+        desc: "定向测试开发"
+        task:
+          - "第1步：基于 03_{DUT}_functions_and_checks.md 中的 <CK-*> 检测点，为每个关键功能点编写定向 Sequence。"
+          - "第2步：每个 Sequence 对应一个 UVM Test Class，注册到 testcase 列表中。"
+          - "第3步：优先覆盖 Stage 4 静态分析中发现的高/中置信度 Bug 对应的检测点。"
+          - "第4步：测试用例命名规范：test_{DUT}_{功能组}_{功能点}。"
+          - "第5步：运行每个用例确认结果。Pass → 功能正确；Fail → 可能发现 Bug，记录到 06_{DUT}_bug_analysis.md。"
+        checker:
+          - name: uvm_test_list_check
+            clss: "examples.UVM_Tianjian.scripts.uvm_checkers.UvmTestListChecker"
+            args: { spec_file: "{OUT}/03_{DUT}_functions_and_checks.md", test_dir: "{OUT_PATH}/tests" }
+      - name: random_tests
+        desc: "随机测试开发"
+        task:
+          - "第1步：编写随机化 Sequence，充分利用 Transaction 的 constraint 进行约束随机。"
+          - "第2步：设计多种随机场景：正常随机流量、极限 backpressure、burst 模式与 idle 间隔混合、多通道并行交叉。"
+          - "第3步：每个随机用例设置独立的 seed，确保可复现。"
+        checker:
+          - name: uvm_random_syntax_check
+            clss: "examples.UVM_Tianjian.scripts.uvm_checkers.UvmSyntaxChecker"
+            args: { target_file: "{OUT_PATH}/tests" }
+
+  # ========== Stage 8: 回归测试与覆盖率分析 ==========
+  - name: regression_and_coverage
+    desc: "回归测试与覆盖率分析"
+    task:
+      - "第1步：使用 `RunUVMRegression` 大批量运行随机 seed 测试。"
+      - "第2步：使用 `ExtractCoverageMetrics` 提取最新的代码与功能覆盖率。"
+      - "第3步：针对未达标（通常是90%阈值）的条目，迭代添加具有特定约束的定向 Sequences 或放宽约束条件。"
+      - "第4步：将覆盖率分析结果写入 {OUT}/07_{DUT}_coverage_report.md。"
+    output_files:
+      - "{OUT}/07_{DUT}_coverage_report.md"
+    checker:
+      - name: uvm_coverage_threshold_check
+        clss: "examples.UVM_Tianjian.scripts.uvm_checkers.UvmCoverageThresholdChecker"
+        args: { coverage_report: "{OUT_PATH}/urgReport", threshold: 90.0 }
+
+  # ========== Stage 9: 验证总结与交付 ==========
+  - name: verification_review_and_summary
+    desc: "验证总结与交付"
+    task:
+      - "第1步：分析整个跑完的回归覆盖图，产出 {OUT}/08_{DUT}_verification_summary.md。"
+      - "第2步：总结在 UVM 过程中发现的高置信度 Bug 以及在静态分析阶段发现的 Bug。"
+      - "第3步：回顾验证规划 01_{DUT}_verification_needs_and_plan.md 中的目标是否全部达成。"
+      - "参考 Guide_Doc/dut_test_summary.md 了解总结报告格式。"
+    reference_files:
+      - "{OUT}/01_{DUT}_verification_needs_and_plan.md"
+      - "{OUT}/06_{DUT}_bug_analysis.md"
+      - "{OUT}/04_{DUT}_static_bug_analysis.md"
+      - "{OUT}/07_{DUT}_coverage_report.md"
+      - "Guide_Doc/dut_test_summary.md"
+    output_files:
+      - "{OUT}/08_{DUT}_verification_summary.md"
+    checker:
+      - name: human_signoff_check
+        clss: "HumanChecker"
+        args: {}
+
+# ============================================================================
+# VManager LLM Suggestion Configuration
+# ============================================================================
+vmanager:
+  llm_suggestion:
+    check_fail_refinement:
+      system_prompt: >
+        你是一名资深的 UVM 验证专家，负责协助另一位 LLM 专家（当前 DUT 为 `{DUT}`）完成 UVM 验证工作。
+        验证过程分为多个阶段，每个阶段结束后需要通过 'Check' 工具进行检查。
+        你的任务是分析当前阶段 Check 未通过的原因，然后提供精准的改进建议。
+        在分析时，请重点关注以下 UVM 验证常见问题：
+        1. **UVM_FATAL**：环境配置错误（如 Agent 未正确连接、Factory 未注册等），必须优先修复
+        2. **UVM_ERROR**：Scoreboard 比对失败或协议违规，需区分是参考模型逻辑错误还是 RTL 缺陷
+        3. **编译错误**：SystemVerilog 语法错误、UVM 宏使用不当、信号连线遗漏
+        4. **覆盖率不足**：covergroup/coverpoint 未正确映射 FG/FC/CK 标签、sample() 未被调用
+        5. **测试用例遗漏**：CK 检测点未被任何 Sequence 覆盖
+        在你的建议中：
+        1. 必须保留检查失败数据中的关键信息
+        2. 提出的解决方案应清晰且可操作
+        3. 优先考虑对通过检查影响最大的建议
+        4. 不要在最终建议中包含思考过程，只提供可操作的建议
+        注意事项：
+          你的工具调用配额有限，请明智使用。
+          高级任务的目标是完成 {DUT} 的 UVM 验证，确保所有测试通过且覆盖率达标。
+      suggestion_prompt: >
+        当前 UVM 验证阶段未通过检查（Check Fail），请分析上述的检查信息，提供精准的改进建议以通过检查。
+        请特别关注：UVM_FATAL/UVM_ERROR 问题、编译错误、覆盖率映射缺失、测试用例遗漏。
+    check_pass_refinement:
+      system_prompt: >
+        你是一名 UVM 验证质量评审专家，擅长识别验证环境中的问题，对验证完备性有极高的质量标准。
+        现在有另外一位 LLM UVM 验证专家正在对 DUT（{DUT}）进行 UVM 验证工作。
+        在每个关键阶段结束时，它需要你对结果进行评估。只有在你确认没有问题后，它才能继续后续阶段。
+        你的具体职责如下：
+        (1) 明确当前阶段的具体任务，并根据阶段要求定义评估标准
+        (2) 检查环境完备性：Transaction 约束是否充分、Scoreboard 参考模型是否完整、fcov 映射是否覆盖所有 FG/FC/CK
+        (3) 检查测试用例与规划文档 (03_...md) 中 CK 检测点的一致性
+        (4) 如果发现问题，提供清晰且可操作的改进建议
+        (5) 如果没有发现问题，调用工具 `ApproveStagePass` 批准当前阶段通过
+        (6) 防止 LLM 验证专家为了通过 Checker 检查而忽略了实际的验证工作
+        重要说明：
+        • 你非常重视确保没有功能点遗漏
+        • 检查 UVM 组件代码是否遵循最佳实践（如工厂注册、phase 使用）
+        • 你的建议应简明扼要，避免冗长
+      suggestion_prompt: >
+        当前 LLM UVM 验证专家已完成当前阶段的任务。
+        请根据上述要求评估任务是否已正确完成。
+        若发现任何问题，请提供清晰且可操作的改进建议。
+        你必须使用 `ApproveStagePass` 批准或不批准当前阶段通过。
