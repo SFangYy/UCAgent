@@ -4,16 +4,15 @@
 Each Checker class implements a ``do_check(timeout, **kwargs)`` method that
 returns ``(success: bool, result: object)``.
 
-Changes from previous version:
-- Removed unused ``EnvironmentIterationChecker`` (superseded by
-  ``EnvironmentDebuggingChecker``).
-- ``EnvSyntaxChecker`` now performs real SystemVerilog syntax validation via
-  ``pyslang`` instead of a naive string search.
+Design principles:
+- RTL bug classification is document-driven: the environment analysis
+  document (``07_{DUT}_env_analysis.md``) is the single source of truth.
+  ``checker.sv`` is NOT used for ``[RTL_BUG]`` markers.
+- Log parsing is centralised in ``parse_avis_log()`` (``formal_tools.py``)
+  and cached via ``FormalStageContext`` across checkers in the same stage.
+- ``EnvSyntaxChecker`` uses ``pyslang`` for real SV syntax validation.
 - ``PropertyStructureChecker`` validates that *Comb*-style properties contain
   no temporal operators.
-- Bare ``except:`` clauses replaced with ``except Exception as e:`` and logged.
-- ``EnvironmentDebuggingChecker._parse_log()`` now delegates to the shared
-  ``parse_avis_log()`` utility in ``formal_tools``.
 """
 
 import os
@@ -26,7 +25,7 @@ from ucagent.util.log import info, warning
 import psutil
 
 # Shared utilities – single source of truth
-from examples.Formal.scripts.formal_tools import parse_avis_log, extract_rtl_bug_properties
+from examples.Formal.scripts.formal_tools import parse_avis_log, extract_rtl_bug_from_analysis_doc
 
 
 # =============================================================================
@@ -42,9 +41,8 @@ class FormalStageContext:
 
     Usage in any checker's do_check::
 
-        ctx = FormalStageContext.get_or_create(self, log_path, checker_path)
+        ctx = FormalStageContext.get_or_create(self)
         parsed_log = ctx.get_parsed_log(log_path)
-        rtl_bugs = ctx.get_rtl_bug_set(checker_path)
         checker_content = ctx.get_checker_content(checker_path)
 
     Data is stored via ``smanager_set_value`` so all checkers sharing the
@@ -57,7 +55,6 @@ class FormalStageContext:
     def __init__(self):
         self._log_cache = {}        # path -> {"mtime": float, "data": dict}
         self._checker_cache = {}    # path -> {"mtime": float, "content": str}
-        self._rtl_bug_cache = {}    # path -> {"mtime": float, "bugs": set}
 
     @classmethod
     def get_or_create(cls, checker_instance, *_args):
@@ -111,59 +108,16 @@ class FormalStageContext:
             }
         return self._checker_cache[checker_path]["content"]
 
-    def get_rtl_bug_set(self, checker_path: str) -> set:
-        """Get set of RTL_BUG-marked property names with mtime-based cache."""
-        if self._is_stale(self._rtl_bug_cache, checker_path):
-            bugs = set()
-            if os.path.exists(checker_path):
-                bugs = set(extract_rtl_bug_properties(checker_path))
-            self._rtl_bug_cache[checker_path] = {
-                "mtime": os.path.getmtime(checker_path) if os.path.exists(checker_path) else 0,
-                "bugs": bugs,
-            }
-        return self._rtl_bug_cache[checker_path]["bugs"]
-
     def invalidate(self, path: str = None):
         """Force invalidate cache for a specific path or all."""
         if path is None:
             self._log_cache.clear()
             self._checker_cache.clear()
-            self._rtl_bug_cache.clear()
         else:
             self._log_cache.pop(path, None)
             self._checker_cache.pop(path, None)
-            self._rtl_bug_cache.pop(path, None)
 
 
-# =============================================================================
-# Basic Checkers
-# =============================================================================
-
-class FormalAnalysisChecker(Checker):
-    """Checks the basic structure of the formal analysis file (verification planning document).
-
-    .. deprecated::
-        This Checker is currently not referenced by formal.yaml and is kept only for backward compatibility.
-    """
-    def __init__(self, analysis_file, **kwargs):
-        self.analysis_file = analysis_file
-
-    def do_check(self, timeout=0, **kwargs) -> tuple[bool, object]:
-        """Checks the formal analysis file for required keywords."""
-        path = self.get_path(self.analysis_file)
-        if not os.path.exists(path):
-            return False, {"error": f"Formal analysis file {self.analysis_file} not found."}
-
-        with open(path, 'r', encoding='utf-8') as f:
-            content = f.read()
-
-        required_keywords = ["Verification Goal", "Verification Scope", "Properties", "FormalMC"]
-        missing = [k for k in required_keywords if k not in content]
-
-        if missing:
-            return False, {"error": f"Formal analysis file missing keywords: {missing}"}
-
-        return True, "Formal analysis file check passed."
 
 
 class PropertyStructureChecker(Checker):
@@ -521,31 +475,32 @@ class BugReportConsistencyChecker(Checker):
     """
     Bug report consistency checker for the formal_execution stage.
 
-    Extracts all properties marked with // [RTL_BUG] from checker.sv,
-    and validates that a corresponding section has been created for each RTL defect in bug_report.md.
+    Extracts all properties judged as RTL_BUG from the environment analysis
+    document (07_{DUT}_env_analysis.md), and validates that a corresponding
+    section has been created for each RTL defect in bug_report.md.
     """
-    def __init__(self, dut_name, property_file, bug_report_file, log_file=None, **kwargs):
+    def __init__(self, dut_name, analysis_doc, bug_report_file, log_file=None, **kwargs):
         self.dut_name = dut_name
-        self.property_file = property_file
+        self.analysis_doc = analysis_doc
         self.bug_report_file = bug_report_file
         self.log_file = log_file if log_file else f"avis/{self.dut_name}.log"
 
     def do_check(self, timeout=0, **kwargs) -> tuple[bool, object]:
         """
         Validates the consistency between the bug report and RTL defects.
-        Extracts properties marked with [RTL_BUG] from checker.sv,
+        Extracts RTL_BUG properties from the analysis document,
         and verifies that bug_report.md has a section for each defect.
         """
-        checker_path = self.get_path(self.property_file)
+        analysis_path = self.get_path(self.analysis_doc)
 
-        # Step 1: Extract RTL defects from checker.sv (shared utility)
-        rtl_defects = extract_rtl_bug_properties(checker_path)
-        info(f"Extracted {len(rtl_defects)} properties marked with [RTL_BUG] from checker.sv")
+        # Step 1: Extract RTL defects from analysis document
+        rtl_defects = extract_rtl_bug_from_analysis_doc(analysis_path)
+        info(f"Extracted {len(rtl_defects)} RTL_BUG properties from analysis document")
 
         if not rtl_defects:
             return True, {
                 "message": "✅ No RTL defects to report",
-                "note": "No properties marked with [RTL_BUG] were found in checker.sv"
+                "note": "No properties judged as RTL_BUG in the analysis document"
             }
 
         # Step 2: Check if bug report exists
@@ -841,20 +796,18 @@ class EnvironmentDebuggingChecker(Checker):
     """
     Environment debugging checker for the environment_debugging_iteration stage.
 
-    Workflow:
-    1. Check if the log exists; if not, execute the TCL script to generate the log.
-    2. If checker.sv or wrapper.sv is newer than the log file, re-execute the TCL script.
-    3. Parse the log to extract TRIVIALLY_TRUE and FALSE properties.
-    4. Categorize FALSE properties:
-       - Properties marked with // [RTL_BUG] in checker.sv → Confirmed RTL defects, ignored in this stage.
-       - Unmarked FALSE properties → Possible environment issues (under-constraint), requiring LLM analysis and decision.
-    5. Pass condition: No TRIVIALLY_TRUE and no unclassified FALSE properties.
+    This checker **always passes** — it provides diagnostic information for
+    the LLM agent to iterate on.  Gate-keeping is handled by
+    ``EnvironmentAnalysisChecker`` via the analysis document.
 
-    FALSE property categorization convention (LLM adds markers in checker.sv):
-    - Confirmed RTL defect: Add // [RTL_BUG] comment before or on the same line as the property definition.
-      Example: // [RTL_BUG] counter does not increment correctly, see counter.v:42
-               A_CK_COUNT_MAX_REACHED: assert property(...);
-    - Confirmed environment issue: After fixing the assume constraints, the property should become PASS.
+    Workflow:
+    1. Check if the log exists; if not, execute the TCL script to generate it.
+    2. If checker.sv or wrapper.sv is newer than the log, re-execute TCL.
+    3. Parse the log to extract TRIVIALLY_TRUE and FALSE properties.
+    4. Report all abnormal properties with SVA code snippets.
+    5. Classification of FALSE properties (RTL_BUG vs ENV_ISSUE) is done
+       exclusively in the environment analysis document (07_env_analysis.md),
+       NOT via markers in checker.sv.
     """
     def __init__(self, dut_name, property_file, spec_file, log_file, checker_file, tcl_script, **kwargs):
         self.dut_name = dut_name
@@ -863,31 +816,6 @@ class EnvironmentDebuggingChecker(Checker):
         self.log_file = log_file
         self.checker_file = checker_file
         self.tcl_script = tcl_script
-
-    def _parse_log(self, log_path: str) -> dict:
-        """Parse avis.log using the shared parser, returning a structured result.
-
-        Delegates to ``parse_avis_log`` for the heavy lifting, then adds a
-        summary dict for convenience.
-        """
-        parsed = parse_avis_log(log_path)
-
-        # Re-key to match previous API expected by do_check
-        result = {
-            "trivially_true": parsed["trivially_true"],
-            "false_props":    parsed["false"],
-            "pass_props":     parsed["pass"],
-            "cover_pass":     parsed["cover_pass"],
-            "cover_fail":     parsed["cover_fail"],
-            "summary": {
-                "assert_pass":            len(parsed["pass"]),
-                "assert_trivially_true":  len(parsed["trivially_true"]),
-                "assert_false":           len(parsed["false"]),
-                "cover_pass":             len(parsed["cover_pass"]),
-                "cover_fail":             len(parsed["cover_fail"]),
-            },
-        }
-        return result
 
     def _extract_prop_code(self, prop_name: str, checker_content: str) -> str:
         """
@@ -906,65 +834,6 @@ class EnvironmentDebuggingChecker(Checker):
                 end = min(len(lines), i + 4)
                 return '\n'.join(lines[start:end])
         return "(Property definition not found)"
-
-    def _classify_false_props(self, false_props: list, checker_content: str) -> tuple[list, list]:
-        """
-        Categorizes FALSE properties into confirmed RTL defects and unclassified ones.
-
-        Criterion: Whether there is an [RTL_BUG] marker within the corresponding property...endproperty block or its preceding comment area.
-        Search range: From 3 lines before the `property CK_XXX;` definition line to 2 lines after the assert statement line.
-        This ensures correct detection regardless of whether the LLM places [RTL_BUG] before the property block or before the assert line.
-
-        Returns: (rtl_defects, unclassified)
-        """
-        lines = checker_content.split('\n')
-        rtl_defects = []
-        unclassified = []
-
-        for prop in false_props:
-            found_marker = False
-
-            # Derive property block name CK_XXX from A_CK_XXX (remove A_ prefix)
-            ck_name = prop[2:] if prop.startswith('A_') else prop
-
-            # 1. Find assert line: A_CK_XXX: assert property(...)
-            assert_idx = None
-            for i, line in enumerate(lines):
-                if prop in line and 'assert' in line:
-                    assert_idx = i
-                    break
-
-            # 2. Find property definition line: property CK_XXX; or property CK_XXX (
-            prop_def_idx = None
-            for i, line in enumerate(lines):
-                if re.search(rf'\bproperty\s+{re.escape(ck_name)}\b', line):
-                    prop_def_idx = i
-                    break
-
-            # 3. Determine search range
-            if prop_def_idx is not None:
-                # 3 lines before property definition (covering [RTL_BUG] comment area)
-                search_start = max(0, prop_def_idx - 3)
-            elif assert_idx is not None:
-                # If property definition not found, fallback to 10 lines before assert line
-                search_start = max(0, assert_idx - 10)
-            else:
-                # Not found at all, mark as unclassified
-                unclassified.append(prop)
-                continue
-
-            search_end = min(len(lines), (assert_idx if assert_idx is not None else prop_def_idx + 10) + 3)
-
-            window = '\n'.join(lines[search_start:search_end])
-            if '[RTL_BUG]' in window:
-                found_marker = True
-
-            if found_marker:
-                rtl_defects.append(prop)
-            else:
-                unclassified.append(prop)
-
-        return rtl_defects, unclassified
 
     def _need_rerun(self, log_path: str, checker_path: str, wrapper_path: str) -> tuple[bool, str]:
         """
@@ -1036,25 +905,13 @@ class EnvironmentDebuggingChecker(Checker):
         false_props = parsed["false_props"]
         summary = parsed["summary"]
 
-        # Step 3: Read checker.sv (via shared stage context)
+        # Step 3: Read checker.sv for SVA code display only
         checker_content = ctx.get_checker_content(checker_path)
 
-        # Step 4: Categorize all Fail properties (assert fail + cover fail)
-        # Criterion: presence of [RTL_BUG] comment in checker.sv
-        #   - With [RTL_BUG] marker → Confirmed RTL defect, allow passing in this stage, deep analysis in formal_execution
-        #   - No marker             → Unclassified, must be handled (fix environment or mark RTL_BUG)
-        rtl_defects_assert, unclassified_false = self._classify_false_props(false_props, checker_content)
-        rtl_defects_cover, unclassified_cover_fail = self._classify_false_props(parsed["cover_fail"], checker_content)
-
-        all_rtl_defects = rtl_defects_assert + rtl_defects_cover
-        all_unclassified = unclassified_false + unclassified_cover_fail
-
-        # Step 5: Determine pass condition
-        # TRIVIALLY_TRUE is a warning (does not block pass); any unclassified Fail blocks (must fix environment or mark RTL_BUG)
+        # Step 4: Build report
         has_tt = len(trivially_true) > 0
-        has_unclassified = len(all_unclassified) > 0
+        has_false = len(false_props) > 0 or len(parsed.get("cover_fail", [])) > 0
 
-        # Build common report body
         report = {"summary": summary, "log_path": log_path}
 
         if has_tt:
@@ -1067,108 +924,56 @@ class EnvironmentDebuggingChecker(Checker):
                     "Fix Directions:\n"
                     "  1. Check if the corresponding assume constraints are too strong (excluding legal inputs).\n"
                     "  2. Check if $isunknown / !$isunknown assertions are correct—if a signal can't be X, it will be constant-folded.\n"
-                    "  3. Check if wrapper.sv signal mapping is incorrect, leading to constant propagation.\n"
-                    "Note: TRIVIALLY_TRUE does not block stage completion, but it's recommended to fix them to improve verification effectiveness."
+                    "  3. Check if wrapper.sv signal mapping is incorrect, leading to constant propagation."
                 )
             }
 
-        def _build_unclassified_detail(props, prop_kind):
-            details = []
-            for prop in props:
+        if has_false:
+            all_fail = false_props + parsed.get("cover_fail", [])
+            fail_details = []
+            for prop in all_fail:
                 code = self._extract_prop_code(prop, checker_content)
-                details.append({"property": prop, "sva_code": code})
-            prop_list = "\n".join(f"  - {p}" for p in props)
-            if prop_kind == "assert":
-                hint = (
-                    f"The following {len(props)} assert Fail properties have not been categorized and need to be analyzed one by one:\n{prop_list}\n\n"
-                    "Analysis Steps (for each property):\n"
-                    "  1. Read the SVA code shown above to understand what this property is verifying.\n"
-                    "  2. Use the ReadTextFile tool to examine the RTL code and analyze why this property failed.\n"
-                    "  3. Decision: Is this an RTL bug? Or an environmental issue where insufficient constraints allowed the tool to find an unrealistic counterexample?\n"
-                    "     Environment Issue Characteristics: Counterexample shows unreasonable input combinations; or assume constraints are obviously missing.\n"
-                    "     RTL Defect Characteristics: Counterexample demonstrates a real RTL functional error (e.g., bit-width error, arithmetic error, logic error).\n"
-                    "  4. If confirmed as an RTL defect: Add the following before the property definition in checker.sv:\n"
-                    "       // [RTL_BUG] <Short Description>\n"
-                    "  5. If confirmed as an environment issue: Fix the corresponding assume constraint; the property should become PASS after the fix.\n"
-                    "  6. After completing all markings/fixes, call Check again."
+                fail_details.append({"property": prop, "sva_code": code})
+            report["false_properties"] = {
+                "count": len(all_fail),
+                "props": all_fail,
+                "details": fail_details,
+                "hint": (
+                    "For each FALSE property, analyze whether it is:\n"
+                    "  - Environment issue (missing assume) → fix checker.sv constraints\n"
+                    "  - RTL defect → record in the environment analysis document (07_env_analysis.md)\n"
+                    "Classification is done in the analysis document, NOT in checker.sv."
                 )
-            else:
-                hint = (
-                    f"The following {len(props)} cover Fail properties have not been categorized and need to be analyzed one by one:\n{prop_list}\n\n"
-                    "cover Fail means the scenario was never reached. Analysis steps:\n"
-                    "  1. Read the SVA code shown above to understand what state this cover is supposed to reach.\n"
-                    "  2. Use the ReadTextFile tool to examine the RTL code and assume constraints.\n"
-                    "  3. Decision: Is this scenario unreachable due to an RTL bug? Or is the assume too strong, excluding this scenario?\n"
-                    "     Environment Over-constraint Characteristics: Scenario becomes reachable after relaxing the assume.\n"
-                    "     RTL Defect Characteristics: Logically should be reachable, but RTL implementation is incorrect.\n"
-                    "  4. If confirmed as an RTL defect: Add the following before the property definition in checker.sv:\n"
-                    "       // [RTL_BUG] <Short Description>\n"
-                    "  5. If confirmed as an environment over-constraint: Fix the corresponding assume; the cover should become PASS after the fix.\n"
-                    "  6. After completing all markings/fixes, call Check again."
-                )
-            return {"count": len(props), "props": props, "details": details, "analysis_required": hint}
+            }
 
-        if unclassified_false:
-            report["unclassified_assert_fail"] = _build_unclassified_detail(unclassified_false, "assert")
+        # This checker always passes — EnvironmentAnalysisChecker handles gate-keeping
+        msg = "✅ Environment debugging check completed"
+        if has_tt or has_false:
+            msg += f" ({len(trivially_true)} TT, {len(false_props)} assert fail, {len(parsed.get('cover_fail', []))} cover fail remaining)"
+        report["message"] = msg
+        return True, report
 
-        if unclassified_cover_fail:
-            report["unclassified_cover_fail"] = _build_unclassified_detail(unclassified_cover_fail, "cover")
-
-        if all_rtl_defects:
-            report["rtl_defects_already_marked"] = all_rtl_defects
-
-        if has_unclassified:
-            parts = []
-            if unclassified_false:
-                parts.append(f"{len(unclassified_false)} assert Fail unclassified")
-            if unclassified_cover_fail:
-                parts.append(f"{len(unclassified_cover_fail)} cover Fail unclassified")
-            report["error"] = (
-                "❌ Environment debugging incomplete: " + ", ".join(parts) +
-                ".\nPlease analyze each Fail property: add // [RTL_BUG] if it's an RTL defect; fix the assume constraint if it's an environment issue."
-            )
-            if has_tt:
-                report["error"] += f"\n(Additionally, there are {len(trivially_true)} TRIVIALLY_TRUE warnings, suggested to fix but not blocking)"
-            return False, report
-
-        # Pass: All Fails categorized (TRIVIALLY_TRUE is warning only)
-        rtl_list = "\n".join(f"  - {p}" for p in all_rtl_defects)
-        result = {
-            "summary": summary,
-            "rtl_defects_confirmed": all_rtl_defects,
-            "note": (
-                f"Confirmed {len(all_rtl_defects)} RTL defects (marked [RTL_BUG]), "
-                "which will be analyzed in depth during the formal_execution stage:\n" + rtl_list
-                if all_rtl_defects else "No unclassified Fail properties, verification environment quality is good"
-            ),
-            "log_path": log_path
-        }
-        if has_tt:
-            result["message"] = f"✅ Environment debugging stage passed (with {len(trivially_true)} TRIVIALLY_TRUE warnings, fix suggested)"
-            result["warning_trivially_true"] = report["warning_trivially_true"]
-        else:
-            result["message"] = "✅ Environment debugging stage passed"
-        return True, result
 
 # =============================================================================
-# Environment Analysis Document Checker (Tri-source Validation)
+# Environment Analysis Document Checker (Dual-source Validation)
 # =============================================================================
 
 class EnvironmentAnalysisChecker(Checker):
-    """Validates the environment analysis document against log results and
-    checker.sv markers.
+    """Validates the environment analysis document against log results.
 
-    Implements a tri-source validation strategy:
+    Implements a dual-source validation strategy:
       1. **avis.log** → Source of truth for TRIVIALLY_TRUE / FALSE property lists.
-      2. **checker.sv** → Source of truth for [RTL_BUG] markers.
-      3. **07_{DUT}_env_analysis.md** → Structured analysis document produced by LLM.
+      2. **07_{DUT}_env_analysis.md** → Structured analysis document produced by LLM,
+         and the single source of truth for RTL bug classification.
+
+    Note: ``checker_file`` is accepted only for mtime-based rerun detection
+    (re-execute TCL when source files change).  Its content is NOT parsed.
 
     Pass conditions (ALL must be satisfied):
       - Every TRIVIALLY_TRUE property has a corresponding <TT-NNN> entry in the doc.
       - Every FALSE property (assert + cover) has a <FA-NNN> entry in the doc.
-      - RTL_BUG judgments in the doc are consistent with [RTL_BUG] markers in checker.sv.
       - ACCEPTED ratio for TRIVIALLY_TRUE does not exceed the configured threshold.
-      - No unresolved ENV_ISSUE entries (property still FALSE after claimed fix).
+      - All required fields are filled in each TT/FA entry.
       - Iteration convergence: fail count should not increase across consecutive checks.
     """
 
@@ -1181,7 +986,7 @@ class EnvironmentAnalysisChecker(Checker):
                  tcl_script, accepted_ratio_threshold=50.0, **kwargs):
         self.dut_name = dut_name
         self.log_file = log_file
-        self.checker_file = checker_file
+        self.checker_file = checker_file  # used only for mtime rerun detection
         self.analysis_doc = analysis_doc
         self.tcl_script = tcl_script
         self.accepted_ratio_threshold = accepted_ratio_threshold
@@ -1267,16 +1072,6 @@ class EnvironmentAnalysisChecker(Checker):
 
         return entry
 
-    def _parse_log(self, log_path: str) -> dict:
-        """Delegate to shared parse_avis_log and restructure."""
-        raw = parse_avis_log(log_path)
-        return {
-            "trivially_true": raw.get("trivially_true", []),
-            "false_props": raw.get("false", []),
-            "cover_fail": raw.get("cover_fail", []),
-            "pass": raw.get("pass", []),
-            "cover_pass": raw.get("cover_pass", []),
-        }
 
     # -------------------------------------------------------------------------
     # Iteration convergence tracking
@@ -1470,14 +1265,13 @@ class EnvironmentAnalysisChecker(Checker):
         tt_entries = doc["tt_entries"]
         fa_entries = doc["fa_entries"]
 
-        # Step 6: Read checker.sv for [RTL_BUG] markers (via shared stage context)
-        rtl_bugs_in_checker = ctx.get_rtl_bug_set(checker_path)
 
-        # Step 7: Tri-source validation
+        # Step 6: Dual-source validation (log × analysis doc)
+        # Note: checker.sv is no longer a validation source — analysis doc is sole truth for bug classification
         errors = []
         warnings = []
 
-        # --- 7a: Completeness — every TT prop must have a <TT-*> entry ---
+        # --- 6a: Completeness — every TT prop must have a <TT-*> entry ---
         missing_tt = []
         for prop in tt_props:
             if prop not in tt_entries:
@@ -1488,7 +1282,7 @@ class EnvironmentAnalysisChecker(Checker):
                 + "\n".join(f"  - {p} (needs a <TT-NNN> entry)" for p in missing_tt)
             )
 
-        # --- 7b: Completeness — every FALSE prop must have a <FA-*> entry ---
+        # --- 6b: Completeness — every FALSE prop must have a <FA-*> entry ---
         all_false = false_props + cover_fail
         missing_fa = []
         for prop in all_false:
@@ -1500,31 +1294,7 @@ class EnvironmentAnalysisChecker(Checker):
                 + "\n".join(f"  - {p} (needs a <FA-NNN> entry)" for p in missing_fa)
             )
 
-        # --- 7c: Consistency — RTL_BUG judgment must match checker.sv markers ---
-        doc_rtl_bugs = {name for name, e in fa_entries.items()
-                        if e.get("judgment", "").strip().upper() == "RTL_BUG"}
-        # Check: doc says RTL_BUG but checker.sv has no marker
-        unmarked = doc_rtl_bugs - rtl_bugs_in_checker
-        if unmarked:
-            errors.append(
-                f"❌ {len(unmarked)} properties judged as RTL_BUG in document but missing "
-                f"// [RTL_BUG] marker in checker.sv:\n"
-                + "\n".join(f"  - {p}" for p in unmarked)
-                + "\n  → Add '// [RTL_BUG] <description>' before each property definition in checker.sv"
-            )
-
-        # Check: checker.sv has [RTL_BUG] but doc doesn't say RTL_BUG
-        undocumented_rtl = rtl_bugs_in_checker - doc_rtl_bugs
-        # Filter to only those that are actually FALSE in log
-        undocumented_rtl = undocumented_rtl & set(all_false)
-        if undocumented_rtl:
-            warnings.append(
-                f"⚠️  {len(undocumented_rtl)} properties have [RTL_BUG] in checker.sv but "
-                f"document judgment is not RTL_BUG:\n"
-                + "\n".join(f"  - {p}" for p in undocumented_rtl)
-            )
-
-        # --- 7d: ACCEPTED ratio threshold ---
+        # --- 6c: ACCEPTED ratio threshold ---
         if tt_entries:
             accepted_count = sum(
                 1 for e in tt_entries.values()
@@ -1542,7 +1312,7 @@ class EnvironmentAnalysisChecker(Checker):
                     f"Review and fix the underlying assume constraints."
                 )
 
-        # --- 7e: Field completeness check ---
+        # --- 6d: Field completeness check ---
         for prop, entry in tt_entries.items():
             if not entry.get("root_cause", "").strip():
                 errors.append(f"❌ <TT> entry '{prop}' missing '根因分类' field")
@@ -1564,7 +1334,7 @@ class EnvironmentAnalysisChecker(Checker):
             if not entry.get("analysis", "").strip():
                 errors.append(f"❌ <FA> entry '{prop}' missing '分析/反例' field")
 
-        # --- 7f: Convergence warnings ---
+        # --- 6e: Convergence warnings ---
         if conv_msg:
             warnings.append(conv_msg)
 
@@ -1580,8 +1350,9 @@ class EnvironmentAnalysisChecker(Checker):
             "doc_summary": {
                 "tt_entries": len(tt_entries),
                 "fa_entries": len(fa_entries),
+                "rtl_bug_count": sum(1 for e in fa_entries.values()
+                                     if e.get("judgment", "").strip().upper() == "RTL_BUG"),
             },
-            "checker_rtl_bugs": list(rtl_bugs_in_checker),
             "iteration": len(history),
         }
 
@@ -1633,17 +1404,17 @@ class CounterexampleTestgenChecker(Checker):
 
     Checks:
     1. Test file exists.
-    2. If [RTL_BUG] properties exist in checker.sv, each must have a
+    2. If RTL_BUG properties exist in the analysis document, each must have a
        corresponding ``test_cex_`` function in the test file.
     3. Each test function must contain at least one ``assert`` statement
        and a ``dut.Finish()`` call.
-    4. If no [RTL_BUG] properties exist, the test file should contain a
+    4. If no RTL_BUG properties exist, the test file should contain a
        "no defects" comment.
     """
 
-    def __init__(self, dut_name, checker_file, test_file, log_file=None, **kwargs):
+    def __init__(self, dut_name, analysis_doc, test_file, log_file=None, **kwargs):
         self.dut_name = dut_name
-        self.checker_file = checker_file
+        self.analysis_doc = analysis_doc
         self.test_file = test_file
         self.log_file = log_file
 
@@ -1681,13 +1452,13 @@ class CounterexampleTestgenChecker(Checker):
         return functions
 
     def do_check(self, timeout=0, **kwargs) -> tuple[bool, object]:
-        """Validates counterexample test file against [RTL_BUG] properties."""
-        checker_path = self.get_path(self.checker_file)
+        """Validates counterexample test file against RTL_BUG properties from analysis doc."""
+        analysis_path = self.get_path(self.analysis_doc)
         test_path = self.get_path(self.test_file)
 
-        # Step 1: Extract RTL bugs from checker.sv
-        rtl_bugs = extract_rtl_bug_properties(checker_path)
-        info(f"Found {len(rtl_bugs)} properties marked with [RTL_BUG]")
+        # Step 1: Extract RTL bugs from analysis document
+        rtl_bugs = extract_rtl_bug_from_analysis_doc(analysis_path)
+        info(f"Found {len(rtl_bugs)} RTL_BUG properties from analysis document")
 
         # Step 2: Check test file existence
         if not os.path.exists(test_path):
@@ -1696,7 +1467,7 @@ class CounterexampleTestgenChecker(Checker):
                     "error": "❌ Test file does not exist",
                     "details": (
                         f"Please create '{self.test_file}'. "
-                        "Since no [RTL_BUG] properties were found, "
+                        "Since no RTL_BUG properties were found, "
                         "the file should contain a comment: "
                         "'# 形式化验证未发现 RTL 缺陷，无需生成反例测试用例'"
                     ),
@@ -1705,7 +1476,7 @@ class CounterexampleTestgenChecker(Checker):
                 "error": "❌ Test file does not exist",
                 "details": (
                     f"Please create '{self.test_file}' with test functions "
-                    f"for the following {len(rtl_bugs)} [RTL_BUG] properties:"
+                    f"for the following {len(rtl_bugs)} RTL_BUG properties:"
                 ),
                 "rtl_bugs": rtl_bugs,
             }
@@ -1718,10 +1489,10 @@ class CounterexampleTestgenChecker(Checker):
             # Just verify the file exists and has the no-defects comment
             if '无需生成反例测试' in test_content or '未发现 RTL 缺陷' in test_content or 'no RTL defect' in test_content.lower():
                 return True, {
-                    "message": "✅ No [RTL_BUG] properties found; test file correctly indicates no defects",
+                    "message": "✅ No RTL_BUG properties found; test file correctly indicates no defects",
                 }
             return True, {
-                "message": "✅ No [RTL_BUG] properties found; test file exists",
+                "message": "✅ No RTL_BUG properties found; test file exists",
                 "note": "Consider adding a comment indicating no RTL defects were found",
             }
 
@@ -1731,8 +1502,8 @@ class CounterexampleTestgenChecker(Checker):
             return False, {
                 "error": f"❌ No test_cex_* functions found in {self.test_file}",
                 "details": (
-                    f"Found {len(rtl_bugs)} [RTL_BUG] properties but no "
-                    "counterexample test functions. Each [RTL_BUG] property "
+                    f"Found {len(rtl_bugs)} RTL_BUG properties but no "
+                    "counterexample test functions. Each RTL_BUG property "
                     "needs a corresponding test_cex_* function."
                 ),
                 "rtl_bugs": rtl_bugs,
@@ -1761,7 +1532,7 @@ class CounterexampleTestgenChecker(Checker):
 
             if not found:
                 errors.append(
-                    f"Missing test for [RTL_BUG] property '{bug_prop}': "
+                    f"Missing test for RTL_BUG property '{bug_prop}': "
                     f"expected a function like 'test_cex_{normalized}'"
                 )
 
@@ -1795,7 +1566,7 @@ class CounterexampleTestgenChecker(Checker):
         result = {
             "message": (
                 f"✅ Counterexample test generation passed: "
-                f"{len(rtl_bugs)} [RTL_BUG] properties covered by "
+                f"{len(rtl_bugs)} RTL_BUG properties covered by "
                 f"{len(test_funcs)} test functions"
             ),
             "rtl_bugs": rtl_bugs,
@@ -1903,9 +1674,7 @@ class StaticFormalBugLinkageChecker(Checker):
         # 2. Extract detection points corresponding to FALSE properties from avis.log
         if os.path.exists(log_path):
             with open(log_path, 'r', encoding='utf-8', errors='ignore') as f:
-                log_content = f.read()
-            # Extract FALSE properties
-            false_props = re.findall(r'Info-P016: property [\w.]+ is (?:TRIVIALLY_)?FALSE', log_content)
+                pass  # Reserved for future: extract FALSE properties to enrich linkage
 
         return formal_bugs
 

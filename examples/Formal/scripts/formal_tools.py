@@ -17,7 +17,14 @@ from ucagent.tools.fileops import BaseReadWrite
 from ucagent.tools.uctool import UCTool
 from ucagent.util.log import str_error, str_info
 
-__all__ = ["GenerateChecker", "GenerateFormalScript", "RunFormalVerification"]
+__all__ = [
+    "parse_avis_log",
+    "extract_rtl_bug_properties",
+    "extract_rtl_bug_from_analysis_doc",
+    "GenerateChecker",
+    "GenerateFormalScript",
+    "RunFormalVerification",
+]
 
 
 # =============================================================================
@@ -129,6 +136,53 @@ def extract_rtl_bug_properties(checker_path: str) -> List[str]:
                 if match:
                     rtl_bugs.append(match.group(1))
                     break
+    return rtl_bugs
+
+
+def extract_rtl_bug_from_analysis_doc(analysis_path: str) -> List[str]:
+    """Extract RTL_BUG property names from the environment analysis document.
+
+    Parses ``07_{DUT}_env_analysis.md`` and returns property names where
+    the **判定结果 / Judgment** field is ``RTL_BUG``.
+
+    This is the single source of truth for RTL bug identification,
+    replacing the previous ``[RTL_BUG]`` markers in checker.sv.
+
+    Expected document format per entry::
+
+        ### <FA-001> A_CK_SUM_WIDTH
+        - **判定结果**: RTL_BUG
+        ...
+
+    Returns a list of property names, e.g. ``['A_CK_SUM_WIDTH', ...]``.
+    """
+    if not os.path.exists(analysis_path):
+        return []
+
+    with open(analysis_path, "r", encoding="utf-8", errors="ignore") as f:
+        content = f.read()
+
+    rtl_bugs: List[str] = []
+
+    # Match FA entry headers: ### <FA-NNN> PROP_NAME
+    fa_pattern = re.compile(
+        r"###\s*<FA-\d+>\s+(\S+)",
+        re.MULTILINE,
+    )
+
+    for match in fa_pattern.finditer(content):
+        prop_name = match.group(1)
+        # Find the judgment line within the next ~15 lines of this entry
+        entry_start = match.end()
+        # Look for next entry or end of file
+        next_entry = fa_pattern.search(content, entry_start)
+        entry_end = next_entry.start() if next_entry else len(content)
+        entry_block = content[entry_start:entry_end]
+
+        # Check for RTL_BUG judgment
+        if re.search(r"(?:判定结果|Judgment)\s*[：:]\s*.*RTL_BUG", entry_block):
+            rtl_bugs.append(prop_name)
+
     return rtl_bugs
 
 
