@@ -4,6 +4,10 @@ ex_tools:
   - "examples.Formal.scripts.formal_tools.GenerateFormalScript"
   - "examples.Formal.scripts.formal_tools.RunFormalVerification"
 
+# ---------- Skill Configuration ----------
+skill:
+  use_skill: true
+
 # ---------- Template Variables ----------
 template_overwrite:
   DOC_GEN_LANG: "中文"
@@ -97,6 +101,7 @@ mission:
       - 根据 Complete/Check 的结果调整工作，目标是所有检查都通过。
       - 除非 Checker 要求人工确认，否则不需要人工介入或询问。
       - 中途接入时: CurrentTips → Status → AllStageJournal 获取上下文。
+      {skill_system}
 
       **指导文档速查：**
       - dut_functions_and_checks.md — 功能点与检测点
@@ -108,6 +113,11 @@ mission:
       (均位于 Guide_Doc/ 目录)
 
       现在调用`CurrentTips`，开启你的验证工作！
+    skill_system: |
+      - 你可以使用工具`SkillList`来获取所有可用技能的描述以及路径
+      - 在使用工具`CurrentTips`获得当前阶段的任务指导后，优先使用工具`SkillList`列举并学习可用技能
+      - 在计划通过`Complete`工具推进到下一个阶段前，需要通过工具`CheckSkillUsage`检查技能使用情况
+      - 技能中的 `RunSkillScript` 工具可以执行技能脚本，自动生成文档框架，大幅提升效率
     tips:
       allways:
         - "你需要通过Complete工具来判断你是否完成了当前阶段的任务"
@@ -408,27 +418,18 @@ stage:
   # ========== Stage 7: Verification Environment Debugging and Iterative Fixing ==========
   - name: environment_debugging_iteration
     desc: "验证环境调试与迭代修复{MAX_ITERATION: 5}"
+    skill_list:
+      - "env-analysis"
     task:
       - "目标：消除所有环境问题（TRIVIALLY_TRUE 和环境相关 FALSE），确保验证环境无过约束/欠约束，并生成结构化的环境分析文档。"
-      - "**迭代优先策略**：建议按以下顺序处理"
-      - "  1. 先处理 TRIVIALLY_TRUE（环境过约束） — 这类问题会导致所有属性伪通过"
-      - "  2. 再处理 FALSE（逐一判断环境欠约束 vs RTL 缺陷）"
-      - "  3. 最后检查 Cover 属性结果（验证关键状态可达性）"
-      - "第1步：读取 `{OUT}/tests/avis.log`，识别以下两类问题："
-      - "  - TRIVIALLY_TRUE：环境过约束——assume 约束过强，排除了合法场景"
-      - "  - FALSE：需逐一分析，判断是【环境欠约束】（缺少 assume，工具找到不真实的反例）还是【RTL 缺陷】（真实的设计 Bug）"
-      - "第2步：修复环境问题——"
-      - "  - TRIVIALLY_TRUE：检查对应 assume 是否过强，修改 `{OUT}/tests/{DUT}_checker.sv` 放松约束；若 wrapper 信号映射有误则修改 `{OUT}/tests/{DUT}_wrapper.sv`"
-      - "  - FALSE（环境欠约束）：补充缺失的 assume 约束（如未约束的输入组合、缺少 fv_idx 约束等），修复后该属性应变为 PASS"
-      - "  - FALSE（RTL 缺陷）：**不需要修改 checker.sv**，仅在环境分析文档中标记即可"
-      - "  - 若设计使用 fv_idx，检查并补全三个必要约束（M_CK_FV_IDX_STABLE / M_CK_FV_IDX_VALID / M_CK_FV_IDX_KNOWN），参考 `Guide_Doc/dut_property_template.md`"
-      - "第3步：修改完成后，调用 `RunFormalVerification(dut_name=\"{DUT}\")` 立即重新执行验证，根据返回的最新结果继续分析。重复第1-3步直到所有环境问题修复完毕。"
-      - "第4步：**生成环境分析文档**。参考 `Guide_Doc/dut_env_analysis_template.md` 模板，在 `{OUT}/07_{DUT}_env_analysis.md` 中为**每一个**异常属性创建分析条目："
-      - "  - 每个 TRIVIALLY_TRUE 属性 → 创建 `<TT-NNN>` 条目，包含根因分类（ASSUME_TOO_STRONG/SIGNAL_CONSTANT/WRAPPER_ERROR/DESIGN_EXPECTED）、关联 Assume、分析、修复动作（FIXED/ACCEPTED）"
-      - "  - 每个 FALSE 属性（assert fail + cover fail） → 创建 `<FA-NNN>` 条目，包含判定结果（RTL_BUG/ENV_ISSUE/COVER_EXPECTED_FAIL）、反例分析、修复动作"
-      - "  - **重要**：RTL Bug 的标记**仅在此文档中完成**，不需要在 checker.sv 中添加任何标记"
-      - "  - **重要**：ACCEPTED 的 TRIVIALLY_TRUE 属性比例不得超过 50%，超过将被 Checker 拒绝。请优先修复而非接受。"
-      - "第5步：确认所有异常属性已分析、环境分析文档已填写完整后，调用 Check 工具进行阶段验收。Checker 会执行**双源校验**：日志(avis.log) × 分析文档(07_env_analysis.md)。"
+      - "**迭代修复**：读取 avis.log -> 修复 checker.sv/wrapper.sv -> RunFormalVerification 重新验证 -> 重复直到环境问题消除。"
+      - "  - 优先处理 TRIVIALLY_TRUE（过约束），再处理 FALSE（判断环境欠约束 vs RTL 缺陷）"
+      - "  - FALSE（RTL 缺陷）：**不修改 checker.sv**，仅在分析文档中标记"
+      - "  - 若使用 fv_idx，补全三个必要约束，参考 Guide_Doc/dut_property_template.md"
+      - "**文档生成**：使用 `env-analysis` 技能（通过 SkillList 获取）自动生成 `{OUT}/07_{DUT}_env_analysis.md` 框架，逐条填写分析内容。"
+      - "  - ACCEPTED 的 TRIVIALLY_TRUE 比例不得超过 50%"
+      - "  - RTL Bug 标记仅在此文档完成，不在 checker.sv 中添加标记"
+      - "**详细操作步骤见 env-analysis 技能的 SKILL.md。**"
     reference_files:
       - "{OUT}/tests/avis.log"
       - "{OUT}/tests/{DUT}_checker.sv"
@@ -494,55 +495,16 @@ stage:
   # ========== Stage 9: Counterexample Python Test Generation ==========
   - name: counterexample_python_testgen
     desc: "形式化反例 Python 测试用例生成"
+    skill_list:
+      - "counterexample-testgen"
     task:
-      - "目标：根据环境分析文档中判定为 RTL_BUG 的 FALSE 属性及其反例，使用 picker 生成的 Python DUT 包，编写可执行的引脚级 Python 测试用例来复现 Bug。"
-      - "第1步：读取 `{OUT}/07_{DUT}_env_analysis.md`，提取所有判定结果为 `RTL_BUG` 的 `<FA-NNN>` 条目中的属性名称及其分析描述。"
-      - "第2步：读取 `{OUT}/tests/avis.log`，分析每个 FALSE 属性对应的反例信息（触发条件、信号值、时序关系）。"
-      - "第3步：读取 `{OUT}/tests/{DUT}_wrapper.sv`，确认时钟端口和复位端口的 RTL 原始名称及极性（参考 Clock/Reset Remapping 区域的注释）。"
-      - "第4步：读取 RTL 源码文件（{RTL_PATH}/*.v, {RTL_PATH}/*.sv），结合反例信息，确定每个 Bug 的具体触发输入序列。"
-      - "第5步：为每个 RTL_BUG 属性生成一个 Python 测试函数。测试用例**直接操作 DUT 引脚**，不需要封装 API 或 ENV。标准结构如下："
-      - "  ```python"
-      - "  from {DUT} import DUT{DutClass}  # picker 生成的 Python DUT 包"
-      - "  "
-      - "  def test_cex_ck_xxx():"
-      - "      '''反例测试：CK_XXX 属性 — Bug描述"
-      - "      "
-      - "      对应属性: A_CK_XXX"
-      - "      反例条件: a=0xFF, b=0x01, cin=1"
-      - "      预期行为: sum 应等于 0x101"
-      - "      实际行为: sum 被截断为 0x01"
-      - "      '''"
-      - "      dut = DUT{DutClass}()"
-      - "      dut.InitClock('clk')  # 时钟名需与 RTL 一致"
-      - "      "
-      - "      # 复位序列"
-      - "      dut.rst_n.value = 0"
-      - "      dut.Step(5)"
-      - "      dut.rst_n.value = 1"
-      - "      dut.Step(1)"
-      - "      "
-      - "      # 按反例时序驱动引脚"
-      - "      dut.a.value = 0xFF"
-      - "      dut.b.value = 0x01"
-      - "      dut.cin.value = 1"
-      - "      dut.Step(1)"
-      - "      "
-      - "      # 断言：检查预期 vs 实际"
-      - "      expected_sum = 0x101"
-      - "      assert dut.sum.value == expected_sum, \\"
-      - "          f'CK_XXX Bug: 预期 sum={expected_sum:#x}, 实际 sum={dut.sum.value:#x}'"
-      - "      "
-      - "      dut.Finish()"
-      - "  ```"
-      - "第6步：将所有测试函数写入 `{OUT}/tests/test_{DUT}_counterexample.py`。文件顶部需包含 import 语句和文件说明注释。"
-      - "第7步：若环境分析文档中没有任何 RTL_BUG 判定的属性，则生成一个包含以下注释的空测试文件："
-      - "  `# 形式化验证未发现 RTL 缺陷，无需生成反例测试用例`"
-      - "注意事项："
-      - "  - 时钟名和复位名需从 wrapper.sv 的 Clock/Reset Remapping 注释中读取 RTL 原始端口名"
-      - "  - 每个测试函数的 docstring 须包含：对应属性名、Bug描述、反例值"
-      - "  - 断言格式：assert output == expected, '描述信息'"
-      - "  - 每个测试函数末尾须调用 dut.Finish() 释放资源"
-      - "  - 参考 Guide_Doc/dut_counterexample_testcase.md 了解 picker DUT 的完整用法"
+      - "目标：为环境分析文档中判定为 RTL_BUG 的 FALSE 属性，编写引脚级 Python 测试用例复现 Bug。"
+      - "使用 `counterexample-testgen` 技能（通过 SkillList 获取）自动生成 `{OUT}/tests/test_{DUT}_counterexample.py` 框架，然后为每个测试函数填写具体的引脚驱动和断言逻辑。"
+      - "关键要求："
+      - "  - 每个函数命名 test_cex_{ck_name}，包含完整 docstring（属性名、反例条件、预期/实际行为）"
+      - "  - 每个函数至少一个 assert 语句，末尾调用 dut.Finish()"
+      - "  - 若无 RTL_BUG，生成注释文件即可"
+      - "**详细操作步骤和代码示例见 counterexample-testgen 技能的 SKILL.md 和 Guide_Doc/dut_counterexample_testcase.md。**"
     reference_files:
       - "Guide_Doc/dut_counterexample_testcase.md"
       - "{OUT}/07_{DUT}_env_analysis.md"
@@ -566,18 +528,16 @@ stage:
   # (Renumbered from Stage 9 after insertion of counterexample_python_testgen)
   - name: formal_execution
     desc: "RTL缺陷分析与报告"
+    skill_list:
+      - "bug-report"
     task:
       - "目标：对环境分析文档中判定为 RTL_BUG 的属性进行深度分析并生成 BUG 报告。"
-      - "第1步：读取 `{OUT}/07_{DUT}_env_analysis.md`，提取所有判定结果为 `RTL_BUG` 的 `<FA-NNN>` 条目——这些是经环境调试确认的 RTL 缺陷。"
-      - "第2步：参考 `Guide_Doc/dut_bug_report_template.md` 模板，在 `{OUT}/04_{DUT}_bug_report.md` 中为每个缺陷创建独立章节。**必须包含完整标签层级 `<FG-*>/<FC-*>/<BG-*>/<CK-*>/<TC-*>/<FILE-*>`**，严格遵守模板中的字段格式。"
-      - "第3步：结合 RTL 源码和验证反例（从 avis.log 查看失败详情），提供："
-      - "  - **根本原因分析**：逻辑错误的具体成因"
-      - "  - **缺陷代码定位**：文件名和行号"
-      - "  - **预期 vs 实际行为**：准确描述差异"
-      - "  - **修复建议**：具体的代码修改方案"
-      - "  - **反例波形解读**（如有）：关键信号在反例中的变化时序"
-      - "第4步：如果没有发现任何 RTL 缺陷（环境分析文档中无 RTL_BUG 判定），在报告中说明：'形式化验证未发现 RTL 设计缺陷，所有属性已通过证明。'"
-      - "第5步：完成所有章节后调用 Complete。"
+      - "使用 `bug-report` 技能（通过 SkillList 获取）自动生成 `{OUT}/04_{DUT}_bug_report.md` 框架，然后为每个缺陷条目填写分析内容。"
+      - "关键要求："
+      - "  - 必须包含完整标签层级 `<FG-*>/<FC-*>/<BG-*>/<CK-*>/<TC-*>/<FILE-*>`"
+      - "  - 结合 RTL 源码提供：根本原因、缺陷定位、预期/实际行为、修复建议"
+      - "  - 若无 RTL_BUG，声明"形式化验证未发现 RTL 设计缺陷""
+      - "**详细操作步骤和字段规范见 bug-report 技能的 SKILL.md。**"
     reference_files:
       - "Guide_Doc/dut_bug_report_template.md"
       - "{OUT}/07_{DUT}_env_analysis.md"
